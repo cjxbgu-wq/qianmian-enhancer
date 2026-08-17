@@ -504,7 +504,7 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
         [self saveCurrentSettings];
         // 取色结果标记 (安装日志/面板回显读取)
         @try {
-            [NSString stringWithFormat:@"#%02X%02X%02X", (int)(r * 255), (int)(g * 255), (int)(b * 255)]
+            [[NSString stringWithFormat:@"#%02X%02X%02X", (int)(r * 255), (int)(g * 255), (int)(b * 255)]
                 writeToFile:@"/tmp/qm_colorpick_result.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
         } @catch (NSException *e) {}
     }
