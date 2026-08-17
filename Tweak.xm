@@ -66,5 +66,9 @@ static void mark(NSString *name) {
 %end
 
 %ctor {
-    @autoreleasepool {}
+    @autoreleasepool {
+        @try {
+            mark(@"enhancer_injected"); // 模块注入标记 (安装日志检测)
+        } @catch (NSException *e) {}
+    }
 }

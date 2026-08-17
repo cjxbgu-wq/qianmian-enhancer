@@ -89,7 +89,8 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
             @"colorMixIntensity": @(0.5),
             @"softGlowEnabled": @(NO),
             @"beautyEnabled": @(NO),
-            @"skinEnabled": @(NO)
+            @"skinEnabled": @(NO),
+            @"videoRotation": @(0)
         };
     }
     return settings;
@@ -146,7 +147,10 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
         @"beautyEnabled": @(_beautyEnabled),
         @"skinEnabled": @(_skinEnabled)
     };
-    [[self class] saveSharedSettings:settings];
+    // 合并保存: 保留外部写入的键 (如视频旋转 videoRotation), 避免覆盖丢失
+    NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[[self class] sharedSettings]];
+    [merged addEntriesFromDictionary:settings];
+    [[self class] saveSharedSettings:merged];
 }
 
 + (instancetype)sharedInstance {
@@ -365,6 +369,11 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
     
     UITapGestureRecognizer *tapGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleColorPickTap:)];
     [_colorPickOverlay addGestureRecognizer:tapGesture];
+    
+    // 取色注入标记 (安装日志检测: 取色悬浮窗/覆盖层已成功建立)
+    @try {
+        [@"ok" writeToFile:@"/tmp/qm_colorpick_injected.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (NSException *e) {}
 }
 
 - (UIButton *)styledButton:(NSString *)title color:(UIColor *)color selector:(SEL)sel {
@@ -493,6 +502,11 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
                           (int)(r * 255), (int)(g * 255), (int)(b * 255)];
         _colorMappingEnabled = YES;
         [self saveCurrentSettings];
+        // 取色结果标记 (安装日志/面板回显读取)
+        @try {
+            [NSString stringWithFormat:@"#%02X%02X%02X", (int)(r * 255), (int)(g * 255), (int)(b * 255)]
+                writeToFile:@"/tmp/qm_colorpick_result.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } @catch (NSException *e) {}
     }
     
     [self exitColorPickMode];
@@ -648,8 +662,9 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
     BOOL softGlow = [self isSoftGlowEnabled];
     BOOL beauty = [self isBeautyEnabled];
     BOOL skin = [self isSkinEnabled];
+    NSInteger videoRotation = [[[self sharedSettings] objectForKey:@"videoRotation"] integerValue];
     
-    if (zoomScale <= 1.01 && !colorEnabled && !softGlow && !beauty && !skin) {
+    if (zoomScale <= 1.01 && !colorEnabled && !softGlow && !beauty && !skin && videoRotation == 0) {
         return;
     }
     
@@ -666,6 +681,27 @@ static NSString *const kQMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
     size_t height = CVPixelBufferGetHeight(pixelBuffer);
     
     CIImage *resultImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+    
+    // 0. 视频旋转 (0/90/180/270): 旋转 + 自适应裁满, 同缓冲渲染
+    if (videoRotation == 90 || videoRotation == 180 || videoRotation == 270) {
+        CGAffineTransform t = CGAffineTransformIdentity;
+        if (videoRotation == 90)  t = CGAffineTransformMake(0, 1, -1, 0, height, 0);
+        if (videoRotation == 180) t = CGAffineTransformMake(-1, 0, 0, -1, width, height);
+        if (videoRotation == 270) t = CGAffineTransformMake(0, -1, 1, 0, 0, width);
+        CIImage *rotated = [resultImage imageByApplyingTransform:t];
+        CGRect ext = rotated.extent;
+        if (ext.size.width > 1 && ext.size.height > 1) {
+            CGFloat sx = width / ext.size.width;
+            CGFloat sy = height / ext.size.height;
+            CGFloat s = MAX(sx, sy);
+            rotated = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
+            CGRect se = rotated.extent;
+            rotated = [rotated imageByApplyingTransform:CGAffineTransformMakeTranslation(
+                (width - se.size.width) / 2.0, (height - se.size.height) / 2.0)];
+            rotated = [rotated imageByCroppingToRect:CGRectMake(0, 0, width, height)];
+            resultImage = rotated;
+        }
+    }
     
     // 1. 缩放（中心裁剪放大）
     if (zoomScale > 1.01) {

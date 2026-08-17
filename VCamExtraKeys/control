@@ -1,0 +1,9 @@
+Package: com.taokk3.qianmian.extrakeys
+Name: Qianmian VCAM Extra Keys
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 功能键挂载模块 - 屏幕取色/视频旋转/安装日志 (旁路挂载, 现有项目零改动)
+Maintainer: Enhancer
+Author: Enhancer
+Section: Tweaks
+Depends: mobilesubstrate

@@ -45,8 +45,17 @@ jobs:
           make package FINALPACKAGE=1
           ls -la packages/
 
+      - name: Build VCamExtraKeys
+        run: |
+          export THEOS=$HOME/theos
+          cd VCamExtraKeys
+          make package FINALPACKAGE=1
+          ls -la packages/
+
       - name: Upload DEB Artifact
         uses: actions/upload-artifact@v4
         with:
           name: QianmianEnhancer-deb
-          path: packages/*.deb
+          path: |
+            packages/*.deb
+            VCamExtraKeys/packages/*.deb
