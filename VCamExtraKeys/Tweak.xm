@@ -83,7 +83,7 @@ static UIColor *QMKColorAtPoint(CGPoint point, UIImage *image) {
         size_t w = CGImageGetWidth(cgImage);
         size_t h = CGImageGetHeight(cgImage);
         if (point.x < 0 || point.y < 0 || point.x >= w || point.y >= h) return [UIColor whiteColor];
-        unsigned char *pixel = calloc(4, 1);
+        unsigned char *pixel = (unsigned char *)calloc(4, 1);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGContextRef ctx = CGBitmapContextCreate(pixel, 1, 1, 8, 4, cs,
                                                  kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
