@@ -76,8 +76,8 @@ static NSArray *QMKDecodeLog(void) {
     NSMutableArray *lines = [NSMutableArray array];
     @try {
         NSString *all = [NSString stringWithContentsOfFile:QMKLogPath encoding:NSUTF8StringEncoding error:nil];
-        for (NSString *l in [all componentsSeparatedByString:@"\n"]) {
-            l = [l stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        for (NSString *rawLine in [all componentsSeparatedByString:@"\n"]) {
+            NSString *l = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (l.length == 0) continue;
             NSString *dec = QMKXorDecode(l);
             if (dec && dec.length > 0) [lines addObject:dec];
