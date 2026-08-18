@@ -18,7 +18,6 @@
 static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
 static const NSInteger QMK_BAR_TAG  = 0x6E01; // 增强键条
 static const NSInteger QMK_OVER_TAG = 0x6E02; // 取色悬浮层
-static const NSInteger QMK_DOT_TAG  = 0x6E03; // 取色色点
 
 static void QMKMark(NSString *name) {
     @try {
@@ -41,14 +40,6 @@ static NSDictionary *QMKReadSettings(void) {
         return s ?: @{};
     } @catch (NSException *e) {}
     return @{};
-}
-
-static void QMKWriteSetting(NSString *key, id value) {
-    @try {
-        NSMutableDictionary *s = [NSMutableDictionary dictionaryWithDictionary:QMKReadSettings()];
-        [s setObject:value forKey:key];
-        [s writeToFile:QMKSharedSettingsPath atomically:YES];
-    } @catch (NSException *e) {}
 }
 
 static NSInteger QMKIntSetting(NSString *key, NSInteger def) {
