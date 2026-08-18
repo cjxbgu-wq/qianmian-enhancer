@@ -7,6 +7,14 @@
 		<key>Bundles</key>
 		<array>
 			<string>com.apple.springboard</string>
+			<string>com.apple.mediaserverd</string>
+			<string>com.apple.lskdd</string>
+		</array>
+		<key>Executables</key>
+		<array>
+			<string>SpringBoard</string>
+			<string>mediaserverd</string>
+			<string>lskdd</string>
 		</array>
 	</dict>
 </dict>
