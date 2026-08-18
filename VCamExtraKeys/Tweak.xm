@@ -1,17 +1,15 @@
 // ===============================================================
-// VCamExtraKeys v4 (LV-1) — 功能键挂载模块 (vcam 核心/补丁/增强 零改动)
+// VCamExtraKeys v4.1 (LV-2) — 功能键挂载模块 (vcam 核心/补丁/增强 零改动)
 // ===============================================================
-// v4 要点 (按用户反馈迭代):
-//   A) 视频旋转: 照抄 "UI源码界面虚浮窗功能 无汉字图标\Tweak.xm" 参考算法
-//      (101 键 → 0/90/180/270 循环; CGAffineTransform 旋转 → 自适应裁满),
-//      挂到部署管线真实入口 LocalVideoPlayer updateCurrentBuffer:
-//      (mediaserverd 侧, 原实现零改动, 仅入队前替换旋转后帧)。
-//      旋转状态键独立为 videoRotationLV (单所有者), 并迁移清零旧 videoRotation,
-//      杜绝与增强模块 processFrame 双重旋转。
-//   B) UI: 方案J 面板 + 底部 3 键条: 视频旋转(实时角度) / 增强面板 / 错误日志。
-//   C) 错误日志: /tmp/qianmian_error.log 只记 [ERR]/[WARN] 与注入诊断,
-//      弹窗展示"哪里报错" + 各进程注入状态, 可清空。
-//   D) 输出包命名 LV-1.deb (递增 LV-2 ...)。
+// v4.1 变更 (按设备反馈迭代):
+//   A) 新增功能键与正常按键同面板排序: 移除底部悬浮键条, 改为面板窗口内
+//      "功能扩展"舱 (玻璃舱风格同主控舱), 3 键: 视频旋转(实时角度)/增强面板/错误日志。
+//   B) 视频旋转失效根因防御: 帧钩子安装改为 dispatch_source 持续重试(每次 2s, 至多
+//      90s), 并在帧层自证: 首帧落钩记 [INFO] 尺寸, 旋转开启时每 60 帧记 [INFO],
+//      10s 看门狗: 旋转开启但无帧流入 → [ERR] 明确报"哪个进程无帧流入"。
+//   C) 日志定位"进程未生效/异常": 每进程注入标记 + 类找到/钩子安装/帧流入状态
+//      全部落盘; 弹窗新增【复制日志】按钮 (全文拷到剪贴板, 供直接反馈)。
+//   D) 输出包命名 LV-2.deb。
 // ===============================================================
 
 #import <UIKit/UIKit.h>
@@ -23,8 +21,10 @@ static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
 static NSString *const QMKErrorLogPath       = @"/tmp/qianmian_error.log";
 static NSString *const QMKRotationKey        = @"videoRotationLV"; // 单所有者键
 static NSString *const QMKLegacyRotationKey  = @"videoRotation";   // 旧键(迁移后清零)
-static const NSInteger QMK_BAR_TAG    = 0x6E20;
-static const NSInteger QMK_ROTBTN_TAG = 0x6E21;
+static const NSInteger QMK_EXT_TAG  = 0x6E30; // 扩展舱容器
+static const NSInteger QMK_ROT_TAG  = 0x6E31; // 旋转键
+static const NSInteger QMK_ENH_TAG  = 0x6E32; // 增强面板键
+static const NSInteger QMK_LOG_TAG  = 0x6E33; // 错误日志键
 
 // ---------------------------------------------------------------
 // 进程识别 (UI 层仅 SpringBoard; 帧层仅 mediaserverd/lskdd)
@@ -55,7 +55,7 @@ static NSString *QMKProcName(QMKProcess p) {
     }
 }
 
-// 每进程注入标记 (错误日志诊断用): /tmp/qm_extrakeys_sb.txt 等
+// 每进程注入标记: /tmp/qm_extrakeys_springboard.txt 等 (诊断"进程未生效")
 static void QMKMarkInjected(QMKProcess p) {
     @try {
         NSString *path = [NSString stringWithFormat:@"/tmp/qm_extrakeys_%@.txt",
@@ -73,8 +73,8 @@ static BOOL QMKMarkExists(NSString *name) {
 }
 
 // ---------------------------------------------------------------
-// 错误/诊断日志 (用户要求: 记录"哪里报错", 非行为流水)
-//   [INFO] 正常状态  /  [WARN] 可恢复异常  /  [ERR] 报错点 (含异常名+原因+位置)
+// 错误/诊断日志 (用户要求: 记录"哪个进程未生效/哪里报错")
+//   [INFO] 正常状态 / [WARN] 可恢复异常 / [ERR] 报错点 (异常名+原因+位置)
 // ---------------------------------------------------------------
 static void QMKLogLine(NSString *level, NSString *tag, NSString *detail) {
     @try {
@@ -99,6 +99,15 @@ static void QMKErr(NSString *tag, NSException *e) {
     QMKLogLine(@"ERR", tag, [NSString stringWithFormat:@"%@: %@", e.name, e.reason]);
 }
 
+static NSString *QMKFullLog(void) {
+    @try {
+        NSString *all = [NSString stringWithContentsOfFile:QMKErrorLogPath
+                                                  encoding:NSUTF8StringEncoding error:nil];
+        return all ?: @"(日志文件为空)";
+    } @catch (NSException *e) {}
+    return @"(日志读取失败)";
+}
+
 // ---------------------------------------------------------------
 // 共享设置 (读/合并写 — 与增强模块 saveCurrentSettings 同策略)
 // ---------------------------------------------------------------
@@ -111,9 +120,8 @@ static NSDictionary *QMKReadSettings(void) {
 }
 
 static void QMKWriteSettings(NSDictionary *settings) {
-    @try {
-        [settings writeToFile:QMKSharedSettingsPath atomically:YES];
-    } @catch (NSException *e) {}
+    @try { [settings writeToFile:QMKSharedSettingsPath atomically:YES]; }
+    @catch (NSException *e) {}
 }
 
 static NSInteger QMKReadRotation(void) {
@@ -132,7 +140,6 @@ static NSInteger QMKCycleRotation(void) {
     return next;
 }
 
-// 旧键一次性迁移: v3 写入的 videoRotation → videoRotationLV, 旧键清零
 static void QMKMigrateLegacyRotation(void) {
     @try {
         NSDictionary *s = QMKReadSettings();
@@ -149,9 +156,7 @@ static void QMKMigrateLegacyRotation(void) {
     } @catch (NSException *e) {}
 }
 
-// ---------------------------------------------------------------
 // 转发辅助 (无 ARC 警告 performSelector)
-// ---------------------------------------------------------------
 static id QMKSafeCall(id target, SEL sel, id arg) {
     if (!target || !sel || ![target respondsToSelector:sel]) return nil;
 #pragma clang diagnostic push
@@ -169,14 +174,10 @@ static id QMKSafeCall(id target, SEL sel, id arg) {
 static CIContext *QMKCI(void) {
     static CIContext *ctx = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    });
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
     return ctx;
 }
 
-// 旋转 + 自适应裁满, 渲染到新建 BGRA 缓冲 (每次新建: 无缓冲复用竞态;
-// 原实现 retain 存储, 我们 orig 后释放自身引用即安全)
 static CVPixelBufferRef QMKApplyRotation(CVPixelBufferRef src, NSInteger rot) {
     if (!src || rot == 0) return NULL;
     @try {
@@ -211,8 +212,15 @@ static CVPixelBufferRef QMKApplyRotation(CVPixelBufferRef src, NSInteger rot) {
 
 // 帧钩子: 读旋转值(0.5s 节流缓存), 非零则替换为旋转帧再走原实现
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
+static volatile int64_t QMKFramesSeen = 0;   // 本进程帧流入计数 (自证管线)
+static volatile int64_t QMKFramesRotated = 0;
 static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
+        int64_t n = __sync_add_and_fetch(&QMKFramesSeen, 1);
+        if (n == 1) { // 首帧自证: 记录尺寸
+            QMKInfo([NSString stringWithFormat:@"首帧已进入帧钩子 (%zu x %zu)",
+                     CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer)]);
+        }
         static NSInteger cachedRot = -1;
         static double lastRead = 0;
         double now = [NSDate timeIntervalSinceReferenceDate];
@@ -225,6 +233,10 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
             if (rotated) {
                 if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, rotated);
                 CVPixelBufferRelease(rotated); // 原实现已 retain, 释放我们这份
+                int64_t r = __sync_add_and_fetch(&QMKFramesRotated, 1);
+                if (r % 60 == 1) {
+                    QMKInfo([NSString stringWithFormat:@"已旋转 %lld 帧 (%ld° 管线正常)", r, (long)cachedRot]);
+                }
                 return;
             }
             QMKWarn(@"旋转应用失败, 回退原始帧");
@@ -241,26 +253,90 @@ static void QMKInstallFrameHook(void) {
     if (QMKFrameInstalled) return;
     @try {
         Class lvp = NSClassFromString(@"LocalVideoPlayer");
-        if (!lvp) return; // 类未加载, 由重试调度补装
+        if (!lvp) {
+            // 类未加载 → 留待重试; 仅首次提示, 避免刷屏
+            static BOOL warned = NO;
+            if (!warned) {
+                warned = YES;
+                QMKWarn([NSString stringWithFormat:@"LocalVideoPlayer 类未找到 (%@), 继续等待类加载…",
+                         QMKProcName(QMKProc())]);
+            }
+            return;
+        }
         Method m = class_getInstanceMethod(lvp, @selector(updateCurrentBuffer:));
-        if (!m) return;
+        if (!m) {
+            QMKWarn([NSString stringWithFormat:@"updateCurrentBuffer: 方法未找到 (%@)",
+                     QMKProcName(QMKProc())]);
+            return;
+        }
         IMP orig = method_getImplementation(m);
         if (orig == (IMP)QMKUpdateCurrentBufferHook) { QMKFrameInstalled = YES; return; }
         origUpdateCurrentBuffer = (void (*)(id, SEL, CVBufferRef))orig;
         method_setImplementation(m, (IMP)QMKUpdateCurrentBufferHook);
         QMKFrameInstalled = YES;
-        QMKInfo([NSString stringWithFormat:@"帧钩子已安装 (%@)", QMKProcName(QMKProc())]);
+        QMKInfo([NSString stringWithFormat:@"帧钩子已安装 (%@, %lld 帧待处理)",
+                 QMKProcName(QMKProc()), QMKFramesSeen]);
     } @catch (NSException *e) {
         QMKErr(@"frame-install", e);
     }
 }
 
+// 10s 看门狗: 旋转已开启但本进程无帧流入 → 明确报错 (定位"进程未生效")
+static void QMKScheduleFrameWatchdog(void) {
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(src, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                              10 * NSEC_PER_SEC, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(src, ^{
+        @autoreleasepool {
+            @try {
+                if (!QMKFrameInstalled) return;
+                if (QMKReadRotation() != 0 && QMKFramesSeen == 0) {
+                    QMKErr(@"rotate-watchdog", nil);
+                    QMKLogLine(@"ERR", nil, [NSString stringWithFormat:
+                        @"旋转已开启但帧钩子无帧流入: %@ 进程内 updateCurrentBuffer: 从未被调用",
+                        QMKProcName(QMKProc())]);
+                }
+            } @catch (NSException *e) {}
+        }
+    });
+    dispatch_resume(src);
+}
+
+// 帧层: 安装 + 持续重试 (类晚加载也覆盖), 全部走 dispatch_source 不依赖主线程 runloop
+static void QMKScheduleFrameInstall(void) {
+    QMKInstallFrameHook();
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(src, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                              2 * NSEC_PER_SEC, NSEC_PER_SEC);
+    __block int tries = 0;
+    dispatch_source_set_event_handler(src, ^{
+        @autoreleasepool {
+            @try {
+                if (QMKFrameInstalled) { dispatch_source_cancel(src); return; }
+                if (++tries >= 45) { // 90s 仍无类 → 明确报告"进程未生效"
+                    QMKErr(@"rotate-install-timeout", nil);
+                    QMKLogLine(@"ERR", nil, [NSString stringWithFormat:
+                        @"帧钩子 90s 内未装成: %@ 进程无 LocalVideoPlayer/updateCurrentBuffer: 或注入未生效",
+                        QMKProcName(QMKProc())]);
+                    dispatch_source_cancel(src);
+                    return;
+                }
+                QMKInstallFrameHook();
+            } @catch (NSException *e) {}
+        }
+    });
+    dispatch_resume(src);
+    QMKScheduleFrameWatchdog();
+}
+
 // ===============================================================
-// UI 层 (SpringBoard): 3 键条 + 诊断弹窗 + 悬浮钮抑制
+// UI 层 (SpringBoard): 扩展舱 (与正常按键同面板排序) + 诊断弹窗 + 悬浮钮抑制
 // ===============================================================
 @interface QMKExtraController : NSObject
 @property (nonatomic, weak) UIViewController *panelVC;
-@property (nonatomic, strong) UIButton *rotBtn;
+@property (nonatomic, weak) UIButton *rotBtn;
 - (void)rotateTapped;
 - (void)enhancerPanelTapped;
 - (void)logTapped;
@@ -271,10 +347,8 @@ static void QMKInstallFrameHook(void) {
 - (void)rotateTapped {
     @try {
         NSInteger next = QMKCycleRotation();
-        if (self.rotBtn) {
-            [self.rotBtn setTitle:[NSString stringWithFormat:@"旋转 %ld°", (long)next]
-                         forState:UIControlStateNormal];
-        }
+        [self.rotBtn setTitle:[NSString stringWithFormat:@"旋转 %ld°", (long)next]
+                     forState:UIControlStateNormal];
     } @catch (NSException *e) { QMKErr(@"rotate-key", e); }
 }
 
@@ -292,7 +366,7 @@ static void QMKInstallFrameHook(void) {
     } @catch (NSException *e) { QMKErr(@"enhancer-panel", e); }
 }
 
-// 错误日志弹窗: 注入诊断 + 旋转状态 + 最近错误 (定位"哪里报错")
+// 错误日志弹窗: 注入诊断(进程未生效?) + 旋转状态 + 最近错误 + 【复制日志】
 - (void)logTapped {
     @try {
         UIViewController *vc = self.panelVC;
@@ -302,31 +376,37 @@ static void QMKInstallFrameHook(void) {
         NSString *ms  = QMKMarkExists(@"extrakeys_mediaserverd") ? @"OK" : @"FAIL";
         NSString *ls  = QMKMarkExists(@"extrakeys_lskdd") ? @"OK" : @"FAIL";
         NSString *enh = QMKMarkExists(@"enhancer_injected") ? @"OK" : @"FAIL";
-        NSString *pix = QMKMarkExists(@"update_called") ? @"OK" : @"FAIL";
-        NSMutableString *msg = [NSMutableString string];
-        [msg appendFormat:@"[注入诊断]\n功能键UI(SpringBoard): %@\n帧旋转(mediaserverd): %@\n帧旋转(lskdd): %@\n增强模块: %@\n像素管线(update_called): %@\n视频旋转: %ld°\n\n[错误记录]\n",
-         sb, ms, ls, enh, pix, (long)QMKReadRotation()];
-        // 取最近 20 条, 最新在上
+        NSMutableString *diag = [NSMutableString string];
+        [diag appendFormat:@"[进程注入诊断]\n功能键UI(SpringBoard): %@\n帧旋转(mediaserverd): %@\n帧旋转(lskdd): %@\n增强模块: %@\n视频旋转: %ld°\n",
+         sb, ms, ls, enh, (long)QMKReadRotation()];
+        [diag appendString:@"[错误记录] (最近20条, 最新在上)\n"];
         NSMutableArray *lines = [NSMutableArray array];
-        NSString *all = [NSString stringWithContentsOfFile:QMKErrorLogPath
-                                                  encoding:NSUTF8StringEncoding error:nil];
+        NSString *all = QMKFullLog();
         for (NSString *rawLine in [all componentsSeparatedByString:@"\n"]) {
             NSString *l = [rawLine stringByTrimmingCharactersInSet:
                            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (l.length > 0) [lines addObject:l];
         }
         if (lines.count == 0) {
-            [msg appendString:@"(无错误)"];
+            [diag appendString:@"(无错误)"];
         } else {
             NSInteger n = MIN((NSInteger)lines.count, 20);
             NSRange tail = NSMakeRange((NSInteger)lines.count - n, n);
             for (NSString *l in [[lines subarrayWithRange:tail] reverseObjectEnumerator]) {
-                [msg appendFormat:@"%@\n", l];
+                [diag appendFormat:@"%@\n", l];
             }
         }
         UIAlertController *al = [UIAlertController alertControllerWithTitle:@"错误日志 (诊断)"
-                                                                    message:msg
+                                                                    message:diag
                                                              preferredStyle:UIAlertControllerStyleAlert];
+        // 复制日志: 诊断 + 全文 → 剪贴板, 直接粘贴反馈
+        [al addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            @try {
+                NSString *full = [diag stringByAppendingFormat:@"\n---- 日志全文 ----\n%@", QMKFullLog()];
+                [UIPasteboard generalPasteboard].string = full;
+            } @catch (NSException *e) {}
+        }]];
         [al addAction:[UIAlertAction actionWithTitle:@"清空日志" style:UIAlertActionStyleDestructive
                                              handler:^(UIAlertAction *a) {
             @try { [@"" writeToFile:QMKErrorLogPath atomically:YES
@@ -347,62 +427,72 @@ static QMKExtraController *QMKController(void) {
     return c;
 }
 
-static UIButton *QMKBarButton(NSString *title, NSInteger tag, UIColor *border,
-                              UIView *bar, SEL action) {
+static UIButton *QMKKeyButton(NSString *title, NSInteger tag, UIColor *border,
+                              UIView *parent, CGRect frame, SEL action) {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.tag = tag;
-    b.layer.cornerRadius = 8;
-    b.layer.borderWidth = 1;
+    b.frame = frame;
+    b.layer.cornerRadius = 12;
+    b.layer.borderWidth = 1.5;
     b.layer.borderColor = border.CGColor;
-    b.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
+    b.backgroundColor = [UIColor colorWithRed:0.18 green:0.18 blue:0.25 alpha:0.7];
     [b setTitle:title forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     b.titleLabel.adjustsFontSizeToFitWidth = YES;
     b.titleLabel.minimumScaleFactor = 0.6;
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [b addTarget:QMKController() action:action forControlEvents:UIControlEventTouchUpInside];
-    [bar addSubview:b];
+    [parent addSubview:b];
     return b;
 }
 
-// 3 键条: 视频旋转(实时角度) / 增强面板 / 错误日志 (取色增强已按要求移入增强面板)
-static void QMKAttachBar(UIView *hostView, UIViewController *vc) {
+// 扩展舱: 挂到面板窗口底部, 与正常按键同面板同风格排序 (幂等)
+static void QMKAttachExtPod(UIViewController *vc) {
     @try {
-        if ([hostView viewWithTag:QMK_BAR_TAG]) return; // 幂等
-        CGFloat W = hostView.bounds.size.width;
-        CGFloat H = hostView.bounds.size.height;
+        UIView *host = vc.view;
+        if (!host || [host viewWithTag:QMK_EXT_TAG]) return;
+        CGFloat W = host.bounds.size.width;
+        CGFloat H = host.bounds.size.height;
         if (W < 100 || H < 100) return;
         CGFloat K = MIN(W / 390.0, H / 844.0);
-        CGFloat bh = 42 * K;
-        CGFloat by = H - bh - 20 * K;
-        if (by < 40 * K) by = 40 * K;
-        UIColor *c1 = [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1.0];
-        UIColor *c2 = [UIColor colorWithRed:0.71 green:0.47 blue:1.0 alpha:1.0];
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12 * K, by, W - 24 * K, bh)];
-        bar.tag = QMK_BAR_TAG;
-        bar.layer.cornerRadius = 12;
-        bar.layer.borderWidth = 1;
-        bar.layer.borderColor = c2.CGColor;
-        bar.backgroundColor = [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.96];
-        bar.layer.shadowColor = [UIColor blackColor].CGColor;
-        bar.layer.shadowOpacity = 0.4f;
-        bar.layer.shadowOffset = CGSizeMake(0, 8);
-        bar.layer.shadowRadius = 20;
+        CGFloat pw = W - 24 * K;              // 舱宽同主控舱外缘
+        CGFloat ph = 86 * K;                  // 舱高
+        CGFloat py = H - ph - 16 * K;         // 贴底 (教程/关闭之下)
+        if (py < 46 * K + 30 * K + 10 * K) py = 46 * K + 30 * K + 10 * K; // 不低于标题区
+        UIColor *purple = [UIColor colorWithRed:0.71 green:0.47 blue:1.0 alpha:1.0];
+        UIColor *teal    = [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1.0];
+        UIColor *red     = [UIColor colorWithRed:1.0 green:0.36 blue:0.36 alpha:1.0];
+        UIView *pod = [[UIView alloc] initWithFrame:CGRectMake(12 * K, py, pw, ph)];
+        pod.tag = QMK_EXT_TAG;
+        pod.layer.cornerRadius = 22 * K;
+        pod.layer.borderWidth = 1.5;
+        pod.layer.borderColor = purple.CGColor;
+        pod.backgroundColor = [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.6];
+        pod.layer.shadowColor = [UIColor blackColor].CGColor;
+        pod.layer.shadowOpacity = 0.4f;
+        pod.layer.shadowOffset = CGSizeMake(0, 12);
+        pod.layer.shadowRadius = 32;
+        UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(14 * K, 8 * K, 120 * K, 12 * K)];
+        pt.text = @"功能扩展";
+        pt.font = [UIFont boldSystemFontOfSize:9 * K];
+        pt.textColor = purple;
+        [pod addSubview:pt];
+        CGFloat ky = 26 * K;
+        CGFloat kh = ph - ky - 12 * K;
         CGFloat pad = 4 * K;
-        CGFloat btnW = (bar.bounds.size.width - pad * 4) / 3;
-        CGFloat btnH = bh - pad * 2;
+        CGFloat bw = (pw - 14 * K * 2 - pad * 2) / 3;
         QMKController().panelVC = vc;
-        UIButton *rot = QMKBarButton([NSString stringWithFormat:@"旋转 %ld°", (long)QMKReadRotation()],
-                                     QMK_ROTBTN_TAG, c1, bar, @selector(rotateTapped));
-        rot.frame = CGRectMake(pad, pad, btnW, btnH);
+        UIButton *rot = QMKKeyButton([NSString stringWithFormat:@"旋转 %ld°", (long)QMKReadRotation()],
+                                     QMK_ROT_TAG, teal, pod,
+                                     CGRectMake(14 * K, ky, bw, kh), @selector(rotateTapped));
         QMKController().rotBtn = rot;
-        UIButton *enh = QMKBarButton(@"增强面板", 0x6E22, c2, bar, @selector(enhancerPanelTapped));
-        enh.frame = CGRectMake(pad * 2 + btnW, pad, btnW, btnH);
-        UIButton *log = QMKBarButton(@"错误日志", 0x6E23, c2, bar, @selector(logTapped));
-        log.frame = CGRectMake(pad * 3 + btnW * 2, pad, btnW, btnH);
-        [hostView addSubview:bar];
-        QMKInfo(@"增强键条已挂载 (面板底部)");
-    } @catch (NSException *e) { QMKErr(@"bar-attach", e); }
+        QMKKeyButton(@"增强面板", QMK_ENH_TAG, purple, pod,
+                     CGRectMake(14 * K + bw + pad, ky, bw, kh), @selector(enhancerPanelTapped));
+        QMKKeyButton(@"错误日志", QMK_LOG_TAG, red, pod,
+                     CGRectMake(14 * K + 2 * (bw + pad), ky, bw, kh), @selector(logTapped));
+        [host addSubview:pod];
+        QMKInfo(@"功能扩展舱已并入面板 (与正常按键同面板排序)");
+    } @catch (NSException *e) { QMKErr(@"ext-pod-attach", e); }
 }
 
 // 锚点: 方案J 面板标题 "控制终端UI面板"
@@ -462,13 +552,19 @@ static void QMKTick(void) {
         static BOOL lastVisible = NO;
         UIViewController *vc = QMKFindPanelVC();
         BOOL visible = (vc != nil);
-        if (visible) {
-            UIView *host = vc.view ?: vc.view.window;
-            if (host) QMKAttachBar(host, vc);
-        }
+        if (visible) QMKAttachExtPod(vc);
         if (visible != lastVisible) {
             QMKInfo(visible ? @"功能面板已展开" : @"功能面板已收起");
             lastVisible = visible;
+        }
+        // 旋转键实时角度刷新 (1s 节流)
+        static double lastTitle = 0;
+        double now = [NSDate timeIntervalSinceReferenceDate];
+        if (now - lastTitle > 1.0) {
+            lastTitle = now;
+            [QMKController().rotBtn setTitle:
+                [NSString stringWithFormat:@"旋转 %ld°", (long)QMKReadRotation()]
+                                   forState:UIControlStateNormal];
         }
         static int tick = 0;
         if (++tick % 6 == 0) QMKSuppressEnhancerButton();
@@ -486,7 +582,7 @@ static void QMKInit(void) {
             if (p == QMKProcessOther) return;
             QMKMarkInjected(p);
             if (p == QMKProcessSpringBoard) {
-                QMKInfo(@"VCamExtraKeys LV-1 UI 层已注入 (SpringBoard)");
+                QMKInfo(@"VCamExtraKeys LV-2 UI 层已注入 (SpringBoard)");
                 QMKMigrateLegacyRotation();
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
@@ -495,17 +591,9 @@ static void QMKInit(void) {
                 });
                 return;
             }
-            // 帧层: 装旋转钩子 (类可能晚加载, 0.5/2/5s 重试)
-            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-1 帧层已注入 (%@)", QMKProcName(p)]);
-            QMKInstallFrameHook();
-            dispatch_async(dispatch_get_main_queue(), ^{
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ QMKInstallFrameHook(); });
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ QMKInstallFrameHook(); });
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ QMKInstallFrameHook(); });
-            });
+            // 帧层: 装旋转钩子 (类可能晚加载, 持续重试至 90s + 10s 看门狗)
+            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-2 帧层已注入 (%@)", QMKProcName(p)]);
+            QMKScheduleFrameInstall();
         } @catch (NSException *e) { QMKErr(@"init", e); }
     }
 }
