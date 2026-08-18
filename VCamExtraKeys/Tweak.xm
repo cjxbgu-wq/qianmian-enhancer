@@ -1,16 +1,16 @@
-// VCamExtraKeys v5 (LV-3) - 统一功能舱 (vcam 核心/UI补丁/增强模块 零改动)
-// A) 统一构图: 所有功能键放入单一功能舱(4x2): 媒体切换/替换/恢复相机/悬浮球/
-//    视频旋转(实时角度)/增强面板/错误日志/RTMP, 舱底 RTMP 地址行, 舱下状态条,
-//    教程/关闭下移腾位; 原方案J 双舱隐藏(纯UI层, 逻辑零改动):
-//    - 媒体/替换/恢复/悬浮: 直接调用面板 VC 原方法(同补丁图标键 target)
-//    - RTMP 键: 翻转补丁 miniSw(0x6B65) 走原 vpMiniSwitchChanged 镜像链
-//    - 地址行: 双向镜像补丁 miniTf(0x6B66); 状态条: badge(0x6B62)+miniSw
+// VCamExtraKeys v6 (LV-4) - 统一功能舱 v2 (vcam 核心/UI补丁/增强模块 零改动)
+// 修复 v5 双面板/键失效: 补丁面板每次展示新建实例, 旧实例窗口仍可见 →
+//   A1) 枚举所有面板实例, 取最上层可见实例为主面板, 其余整面隐藏 (重复面板彻底消除)
+//   A2) 主面板全量隐藏原控件(标题/双舱/教程/关闭), 仅保留我方统一舱
+//   A3) 键转发固定指向主面板活 VC (不再可能命中陈旧实例)
+//   A4) 10 键 5x2 全功能: 媒体/替换/恢复相机/悬浮球/旋转/增强/日志/RTMP/教程/关闭
+//       (与补丁源码功能一一对应: 4 原方法 + openTutorial + dismissPanel + miniSw/miniTf/badge)
 // B) 视频旋转: 帧层(mediaserverd/lskdd)钩 LocalVideoPlayer updateCurrentBuffer:
 //    照抄参考算法(旋转变换->自适应裁满->渲染回 w x h), 自证诊断:
 //    首帧记尺寸/每60帧报数/10s看门狗(旋转开但无帧流入->ERR)/90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
-// D) 输出 LV-3.deb
+// D) 输出 LV-4.deb
 #import <UIKit/UIKit.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
@@ -32,6 +32,8 @@ static const NSInteger QMK_TAG_BAL  = 0x6E37;
 static const NSInteger QMK_TAG_RTM  = 0x6E38;
 static const NSInteger QMK_TAG_URL  = 0x6E39;
 static const NSInteger QMK_TAG_STT  = 0x6E3A;
+static const NSInteger QMK_TAG_TUT  = 0x6E3B;
+static const NSInteger QMK_TAG_CLS  = 0x6E3C;
 
 static const NSInteger VP_TAG_BADGE   = 0x6B62;
 static const NSInteger VP_TAG_MINISW  = 0x6B65;
@@ -359,6 +361,8 @@ static void QMKUrlCommit(UIViewController *vc);
             case QMK_TAG_RST: [self forwardSel:@selector(restoreCameraTapped)]; break;
             case QMK_TAG_BAL: [self forwardSel:@selector(toggleFloatingBallTapped)]; break;
             case QMK_TAG_RTM: [self toggleRtmp]; break;
+            case QMK_TAG_TUT: [self forwardSel:@selector(openTutorial)]; break;
+            case QMK_TAG_CLS: [self forwardSel:@selector(dismissPanel)]; break;
             default: break;
         }
     } @catch (NSException *e) { QMKErr(@"key-tapped", e); }
@@ -489,26 +493,15 @@ static void QMKAttachUnifiedPod(UIViewController *vc) {
         UIColor *red    = [UIColor colorWithRed:1.0  green:0.36 blue:0.36 alpha:1.0];
         UIColor *slate  = [UIColor colorWithRed:0.49 green:0.61 blue:0.84 alpha:1.0];
 
+        // 全量隐藏原面板控件 (标题/双舱/教程/关闭), 仅保留我方统一舱;
+        // 补丁每次 viewDidLoad 重建后, 下轮 tick 会重新隐藏 (幂等)
+        for (UIView *v in root.subviews) v.hidden = YES;
         UISwitch *miniSw = (UISwitch *)[root viewWithTag:VP_TAG_MINISW];
-        UIView *podL = [miniSw isKindOfClass:[UISwitch class]] ? miniSw.superview : nil;
         UISwitch *rtmpSw = (UISwitch *)[root viewWithTag:VP_TAG_RTMPSW];
-        UIView *podR = [rtmpSw isKindOfClass:[UISwitch class]] ? rtmpSw.superview : nil;
-        if (podL && podL != root) podL.hidden = YES;
-        if (podR && podR != root) podR.hidden = YES;
-        if (!podL || !podR) QMKWarn(@"原双舱定位不全, 统一舱仍挂载");
+        if (![miniSw isKindOfClass:[UISwitch class]]) QMKWarn(@"原 miniSw 未找到 (0x6B65)");
+        if (![rtmpSw isKindOfClass:[UISwitch class]]) QMKWarn(@"原 rtmpSw 未找到 (0x6B67)");
 
-        for (UIView *v in root.subviews) {
-            if (![v isKindOfClass:[UIButton class]]) continue;
-            if (v.tag >= 0x6E30 && v.tag <= 0x6E3F) continue;
-            if (v == podL || v == podR) continue;
-            if (v.frame.origin.y < 500 * K && v.frame.size.width > 60 * K) {
-                CGRect f = v.frame;
-                f.origin.y = 560 * K;
-                v.frame = f;
-            }
-        }
-
-        UIView *pod = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 128 * K, 366 * K, 344 * K)];
+        UIView *pod = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 88 * K, 366 * K, 344 * K)];
         pod.tag = QMK_TAG_POD;
         pod.layer.cornerRadius = 22 * K;
         pod.layer.borderWidth = 1.5;
@@ -525,7 +518,7 @@ static void QMKAttachUnifiedPod(UIViewController *vc) {
         pt.textColor = green;
         [pod addSubview:pt];
 
-        CGFloat kw = (366 * K - 28 * K - 30 * K) / 4;
+        CGFloat kw = (366 * K - 28 * K - 40 * K) / 5;
         CGFloat kh = 80 * K;
         CGFloat ky1 = 30 * K, ky2 = 120 * K;
         NSArray *defs = @[
@@ -539,9 +532,11 @@ static void QMKAttachUnifiedPod(UIViewController *vc) {
             @{@"t": @"📋\n错误日志",  @"tag": @(QMK_TAG_LOG), @"c": red},
             @{@"t": [NSString stringWithFormat:@"📡\nRTMP %@", (miniSw && miniSw.isOn) ? @"ON" : @"OFF"],
               @"tag": @(QMK_TAG_RTM), @"c": slate},
+            @{@"t": @"📖\n教程",     @"tag": @(QMK_TAG_TUT), @"c": blue},
+            @{@"t": @"✖️\n关闭",     @"tag": @(QMK_TAG_CLS), @"c": pink},
         ];
-        for (int i = 0; i < 8; i++) {
-            int col = i % 4, row = i / 4;
+        for (int i = 0; i < 10; i++) {
+            int col = i % 5, row = i / 5;
             CGRect f = CGRectMake((14 + col * (kw + 10)) * K,
                                   (row == 0 ? ky1 : ky2) * K, kw, kh);
             UIButton *b = QMKKeyButton(defs[i][@"t"], [defs[i][@"tag"] integerValue],
@@ -591,7 +586,7 @@ static void QMKAttachUnifiedPod(UIViewController *vc) {
         QMKController().sttRep = rep;
         QMKController().sttRtmp = rtm;
 
-        QMKInfo(@"统一功能舱已挂载 (8 键 + RTMP 输入 + 状态条)");
+        QMKInfo(@"统一功能舱已挂载 (10 键 + RTMP 输入 + 状态条, 原面板控件已隐藏)");
     } @catch (NSException *e) { QMKErr(@"pod-attach", e); }
 }
 
@@ -630,7 +625,7 @@ static void QMKUrlCommit(UIViewController *vc) {
 }
 
 static UIView *QMKFindPanelLabel(UIView *root, int depth) {
-    if (!root || depth > 4) return nil;
+    if (!root || depth > 6) return nil;
     if ([root isKindOfClass:[UILabel class]]) {
         UILabel *lb = (UILabel *)root;
         if ([lb.text isEqualToString:@"控制终端UI面板"]) return root;
@@ -642,23 +637,34 @@ static UIView *QMKFindPanelLabel(UIView *root, int depth) {
     return nil;
 }
 
-static UIViewController *QMKFindPanelVC(void) {
+// 枚举全部面板 VC (含陈旧实例): 每个含"控制终端UI面板"标签的窗口子树
+static NSArray *QMKFindAllPanelVCs(void) {
     @try {
+        NSMutableArray *all = [NSMutableArray array];
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            for (UIView *sv in w.subviews) {
-                UIView *lb = QMKFindPanelLabel(sv, 0);
-                if (lb) {
-                    UIResponder *r = lb;
-                    while (r) {
-                        r = r.nextResponder;
-                        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+            NSArray *stack = [w subviews];
+            while (stack.count) {
+                NSMutableArray *next = [NSMutableArray array];
+                for (UIView *sv in stack) {
+                    UIView *lb = QMKFindPanelLabel(sv, 0);
+                    if (lb) {
+                        UIResponder *r = lb;
+                        while (r) {
+                            r = r.nextResponder;
+                            if ([r isKindOfClass:[UIViewController class]]) {
+                                if (![all containsObject:r]) [all addObject:r];
+                                break;
+                            }
+                        }
                     }
-                    return w.rootViewController;
+                    for (UIView *c in sv.subviews) [next addObject:c];
                 }
+                stack = next;
             }
         }
+        return all;
     } @catch (NSException *e) { QMKErr(@"panel-find", e); }
-    return nil;
+    return @[];
 }
 
 static void QMKSuppressEnhancerButton(void) {
@@ -680,11 +686,24 @@ static void QMKSuppressEnhancerButton(void) {
 static void QMKTick(void) {
     @try {
         static BOOL lastVisible = NO;
-        UIViewController *vc = QMKFindPanelVC();
-        BOOL visible = (vc != nil);
+        // 枚举全部面板实例 (补丁每次展示新建, 旧实例窗口仍可见 → 双面板根因)
+        NSArray *panels = QMKFindAllPanelVCs();
+        UIViewController *primary = nil;
+        for (UIViewController *vc in panels) {
+            UIView *r = vc ? vc.view : nil;
+            if (!r || r.hidden || !r.window || r.window.hidden) continue;
+            primary = vc; // 最后一个可见实例 = 最上层/最新 = 当前操作面板
+        }
+        // 非主面板整面隐藏: 重复面板/旧 UI 彻底消除 (仅在有主面板时; 收起态不
+        // 动任何根, 防止应用仅靠窗口隐藏/恢复时面板被我们永久藏死)
+        for (UIViewController *vc in panels) {
+            if (primary && vc != primary && vc.view && !vc.view.hidden) vc.view.hidden = YES;
+        }
+        BOOL visible = (primary != nil);
         if (visible) {
-            QMKAttachUnifiedPod(vc);
-            QMKRefreshStatus(vc);
+            QMKController().panelVC = primary;
+            QMKAttachUnifiedPod(primary);
+            QMKRefreshStatus(primary);
         }
         if (visible != lastVisible) {
             QMKInfo(visible ? @"功能面板已展开" : @"功能面板已收起");
@@ -711,7 +730,7 @@ static void QMKInit(void) {
             if (p == QMKProcessOther) return;
             QMKMarkInjected(p);
             if (p == QMKProcessSpringBoard) {
-                QMKInfo(@"VCamExtraKeys LV-3 UI 层已注入 (SpringBoard)");
+                QMKInfo(@"VCamExtraKeys LV-4 UI 层已注入 (SpringBoard)");
                 QMKMigrateLegacyRotation();
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
@@ -720,7 +739,7 @@ static void QMKInit(void) {
                 });
                 return;
             }
-            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-3 帧层已注入 (%@)", QMKProcName(p)]);
+            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-4 帧层已注入 (%@)", QMKProcName(p)]);
             QMKScheduleFrameInstall();
         } @catch (NSException *e) { QMKErr(@"init", e); }
     }
