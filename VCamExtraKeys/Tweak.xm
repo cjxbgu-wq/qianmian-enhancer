@@ -2,15 +2,21 @@
 #import <objc/runtime.h>
 
 // ---------------------------------------------------------------
-// VCamExtraKeys: 功能键挂载模块 (旁路挂载, 现有项目零改动)
-//   屏幕取色键: 按键 -> 截屏(三法链, 参考主源码 sampleScreenColor) -> 悬浮窗 -> 点选 -> 写共享设置
-//   视频旋转键: 循环 0/90/180/270, 写共享设置 videoRotation (增强模块像素链内旋转)
-//   安装日志键: 检测注入状态 (像素管线/增强模块/取色注入/映射状态/旋转角度)
-// 全部逻辑 @try/@catch 包裹, 异常不影响 vcam-v3 现有流程
+// VCamExtraKeys v2: 功能键挂载模块 (旁路挂载, VCam 核心零改动)
+//   根因修复(基于 v6.3.4 源码键位表):
+//     - 旧版挂 VCamSettingsViewController (该 class 不存在) -> 键条永不出现
+//     - v6.3.4 设计性隐藏了悬浮球 (FWCtrl +show 直接 return, 注释见 UI源码:4215)
+//     - 悬浮球网格面板(196x244) 已含: 1-6=切换视频 / 转101=视频旋转 / 彩110=取色注入
+//       / 正103=恢复 / 播107 停108 / 关109 / 上下左右 100/102/104/105 / 翻106
+//   本模块 v2:
+//     1) 运行时唤起 FWCtrl doShow -> 恢复"全局唯一悬浮按钮+功能面板" (用户要求流程)
+//     2) 面板下方挂增强键条: 开关替换(toggleReplace) / 开关悬浮(doHide|doShow)
+//        / 安装日志(状态总览)  -- 前两键为 build191 移除、面板缺失的按键
+//     3) 全部逻辑 @try/@catch, 仅 SpringBoard 进程生效, 幂等防重入
 // ---------------------------------------------------------------
 
 static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
-static const NSInteger QMK_BAR_TAG  = 0x6E01; // 功能键条
+static const NSInteger QMK_BAR_TAG  = 0x6E01; // 增强键条
 static const NSInteger QMK_OVER_TAG = 0x6E02; // 取色悬浮层
 static const NSInteger QMK_DOT_TAG  = 0x6E03; // 取色色点
 
@@ -19,6 +25,14 @@ static void QMKMark(NSString *name) {
         NSString *path = [NSString stringWithFormat:@"/tmp/qm_%@.txt", name];
         [@"ok" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (NSException *e) {}
+}
+
+static BOOL QMKIsSpringBoard(void) {
+    @try {
+        NSString *pn = [[NSProcessInfo processInfo] processName];
+        return [pn isEqualToString:@"SpringBoard"];
+    } @catch (NSException *e) {}
+    return NO;
 }
 
 static NSDictionary *QMKReadSettings(void) {
@@ -43,7 +57,7 @@ static NSInteger QMKIntSetting(NSString *key, NSInteger def) {
     return def;
 }
 
-// ---- 屏幕快照 (参考主源码 sampleScreenColor 三法链) ----
+// ---- 屏幕快照 (三法链, 与 vcam sampleScreenColor 同构) ----
 static UIImage *QMKSnapshot(void) {
     @try {
         UIScreen *screen = [UIScreen mainScreen];
@@ -107,20 +121,26 @@ static void QMKPress(UIView *v, BOOL down) {
     }];
 }
 
-// ---- 功能键控制器 (单例, 保存取色状态) ----
+// ---- 功能键控制器 (单例, 保存取色状态 + 键条引用) ----
 @interface QMKExtraController : NSObject
 @property (nonatomic, strong) UIImage *snapshot;
 @property (nonatomic, strong) UIView *overlay;
-@property (nonatomic, strong) UIButton *rotateButton;
-@property (nonatomic, strong) UILabel *rotateLabel;
-@property (nonatomic, weak) UIViewController *host;
+@property (nonatomic, strong) UIView *bar;
+@property (nonatomic, strong) UIButton *replaceBtn;
+@property (nonatomic, strong) UIButton *floatBtn;
+@property (nonatomic, strong) UIButton *logBtn;
+@property (nonatomic, weak) id fwCtrl;
 - (void)startPick:(UIButton *)sender;
 - (void)handlePickTap:(UITapGestureRecognizer *)g;
-- (void)rotateTapped;
+- (void)replaceTapped;
+- (void)floatToggle;
 - (void)logTapped;
-- (void)updateRotateLabel;
-- (void)refreshPickDot;
+- (void)installBarNearPanel:(UIView *)panel;
 @end
+
+// ---- 前向声明 (避免隐式声明编译错误) ----
+static QMKExtraController *QMKController(void);
+static id FWCtrlShared(void);
 
 @implementation QMKExtraController
 
@@ -131,10 +151,15 @@ static void QMKPress(UIView *v, BOOL down) {
             QMKPress(sender, NO);
         });
         if (self.overlay) return; // 已在取色中
-        UIImage *snap = QMKSnapshot(); // 先截屏(不含遮罩)
+        UIImage *snap = QMKSnapshot();
         if (!snap) return;
         self.snapshot = snap;
-        UIView *root = self.host ? self.host.view : nil;
+        // 取色层挂到键条所在窗口, 无 host 时回退主窗口
+        UIWindow *win = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { win = w; break; }
+        }
+        UIView *root = win ? win : [UIApplication sharedApplication].keyWindow;
         if (!root) return;
         UIView *ov = [[UIView alloc] initWithFrame:root.bounds];
         ov.tag = QMK_OVER_TAG;
@@ -184,7 +209,6 @@ static void QMKPress(UIView *v, BOOL down) {
             @try {
                 [hex writeToFile:@"/tmp/qm_colorpick_result.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
             } @catch (NSException *e) {}
-            [self refreshPickDot];
         }
         [ov removeFromSuperview];
         self.overlay = nil;
@@ -192,45 +216,41 @@ static void QMKPress(UIView *v, BOOL down) {
     } @catch (NSException *e) {}
 }
 
-- (void)rotateTapped {
+// 开关替换: 走 vcam 核心 toggleReplace (VCAM_FLAG 文件控制, 核心内部完成状态与日志)
+- (void)replaceTapped {
     @try {
-        NSInteger cur = QMKIntSetting(@"videoRotation", 0);
-        NSInteger next = (cur + 90) % 360;
-        QMKWriteSetting(@"videoRotation", @(next));
-        [self updateRotateLabel];
-    } @catch (NSException *e) {}
-}
-
-- (void)updateRotateLabel {
-    @try {
-        if (self.rotateLabel) {
-            NSInteger cur = QMKIntSetting(@"videoRotation", 0);
-            self.rotateLabel.text = [NSString stringWithFormat:@"旋转 %ld°", (long)cur];
+        id fw = self.fwCtrl;
+        if (!fw) return;
+        QMKPress(self.replaceBtn, YES);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            QMKPress(self.replaceBtn, NO);
+        });
+        if ([fw respondsToSelector:@selector(toggleReplace)]) {
+            [fw performSelector:@selector(toggleReplace)];
         }
     } @catch (NSException *e) {}
 }
 
-- (void)refreshPickDot {
+// 开关悬浮: doHide | doShow (与面板"关"键 109 同语义, 键条自身隐藏跟随)
+- (void)floatToggle {
     @try {
-        UIView *root = self.host ? self.host.view : nil;
-        UIView *dot = [root viewWithTag:QMK_DOT_TAG];
-        if (!dot) return;
-        NSDictionary *s = QMKReadSettings();
-        if ([[s objectForKey:@"colorMappingEnabled"] boolValue]) {
-            CGFloat r = [[s objectForKey:@"colorRed"] floatValue];
-            CGFloat g = [[s objectForKey:@"colorGreen"] floatValue];
-            CGFloat b = [[s objectForKey:@"colorBlue"] floatValue];
-            dot.backgroundColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
-        } else {
-            dot.backgroundColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+        id fw = self.fwCtrl;
+        if (!fw) return;
+        QMKPress(self.floatBtn, YES);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            QMKPress(self.floatBtn, NO);
+        });
+        if ([fw respondsToSelector:@selector(doHide)]) {
+            [fw performSelector:@selector(doHide)];
+        }
+        if (self.bar) {
+            self.bar.hidden = YES;
         }
     } @catch (NSException *e) {}
 }
 
 - (void)logTapped {
     @try {
-        UIViewController *vc = self.host;
-        if (!vc) return;
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *pipe = [fm fileExistsAtPath:@"/tmp/qm_update_called.txt"] ? @"OK" : @"FAIL";
         NSString *mod  = [fm fileExistsAtPath:@"/tmp/qm_enhancer_injected.txt"] ? @"OK" : @"FAIL";
@@ -246,12 +266,108 @@ static void QMKPress(UIView *v, BOOL down) {
         }
         NSString *rot = [NSString stringWithFormat:@"%ld°", (long)QMKIntSetting(@"videoRotation", 0)];
         NSString *msg = [NSString stringWithFormat:
-            @"[像素管线] 帧处理命中: %@\n[增强模块] dylib 注入: %@\n[屏幕取色] 取色模块注入: %@\n[映射状态] %@\n[视频旋转] %@",
+            @"[像素管线] 帧处理命中: %@\n[增强模块] dylib 注入: %@\n[取色键条] 模块注入: %@\n[映射状态] %@\n[增强旋转] %@",
             pipe, mod, pick, (mapOn ? [@"已启用 " stringByAppendingString:hex] : @"未启用"), rot];
+        UIWindow *win = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { win = w; break; }
+        }
+        UIViewController *vc = win ? win.rootViewController : nil;
+        if (!vc) return;
         UIAlertController *al = [UIAlertController alertControllerWithTitle:@"安装日志" message:msg
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [al addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault handler:nil]];
         [vc presentViewController:al animated:YES completion:nil];
+    } @catch (NSException *e) {}
+}
+
+// 增强键条: 挂在 vcam 悬浮面板正下方 (面板 196x244), 3 键等宽
+- (void)installBarNearPanel:(UIView *)panel {
+    @try {
+        if (!panel) return;
+        if (self.bar) {
+            [self.bar removeFromSuperview];
+            self.bar = nil;
+        }
+        UIView *root = panel.superview;
+        if (!root) return;
+        CGRect pf = panel.frame;
+        if (pf.size.width < 100 || pf.size.height < 100) return;
+
+        CGFloat pw = pf.size.width;
+        CGFloat bw = pw;
+        CGFloat bh = 36;
+        CGFloat by = CGRectGetMaxY(pf) + 8;
+        CGRect screen = [UIScreen mainScreen].bounds;
+        if (by + bh > screen.size.height - 10) {
+            by = CGRectGetMinY(pf) - bh - 8; // 底部越界时翻到面板上方
+        }
+        if (by < 10) by = 10;
+
+        UIColor *c1 = [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1.0]; // 极光青
+        UIColor *c2 = [UIColor colorWithRed:0.71 green:0.47 blue:1.0 alpha:1.0]; // 极光紫
+
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(pf.origin.x, by, bw, bh)];
+        bar.tag = QMK_BAR_TAG;
+        bar.layer.cornerRadius = 12;
+        bar.layer.borderWidth = 1;
+        bar.layer.borderColor = c2.CGColor;
+        bar.backgroundColor = [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.96];
+        bar.layer.shadowColor = [UIColor blackColor].CGColor;
+        bar.layer.shadowOpacity = 0.4f;
+        bar.layer.shadowOffset = CGSizeMake(0, 8);
+        bar.layer.shadowRadius = 20;
+
+        CGFloat pad = 4;
+        CGFloat btnW = (bw - pad * 4) / 3;
+        CGFloat btnH = bh - pad * 2;
+
+        // 开关替换
+        UIButton *rep = [UIButton buttonWithType:UIButtonTypeCustom];
+        rep.frame = CGRectMake(pad, pad, btnW, btnH);
+        rep.layer.cornerRadius = 8;
+        rep.layer.borderWidth = 1;
+        rep.layer.borderColor = c1.CGColor;
+        rep.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
+        [rep setTitle:@"开关替换" forState:UIControlStateNormal];
+        rep.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+        [rep setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [rep addTarget:QMKController() action:@selector(replaceTapped) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:rep];
+        QMKController().replaceBtn = rep;
+
+        // 开关悬浮
+        UIButton *flt = [UIButton buttonWithType:UIButtonTypeCustom];
+        flt.frame = CGRectMake(pad * 2 + btnW, pad, btnW, btnH);
+        flt.layer.cornerRadius = 8;
+        flt.layer.borderWidth = 1;
+        flt.layer.borderColor = c2.CGColor;
+        flt.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
+        [flt setTitle:@"开关悬浮" forState:UIControlStateNormal];
+        flt.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+        [flt setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [flt addTarget:QMKController() action:@selector(floatToggle) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:flt];
+        QMKController().floatBtn = flt;
+
+        // 安装日志
+        UIButton *log = [UIButton buttonWithType:UIButtonTypeCustom];
+        log.frame = CGRectMake(pad * 3 + btnW * 2, pad, btnW, btnH);
+        log.layer.cornerRadius = 8;
+        log.layer.borderWidth = 1;
+        log.layer.borderColor = c2.CGColor;
+        log.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
+        [log setTitle:@"安装日志" forState:UIControlStateNormal];
+        log.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+        [log setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [log addTarget:QMKController() action:@selector(logTapped) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:log];
+        QMKController().logBtn = log;
+
+        [root addSubview:bar];
+        self.bar = bar;
+        self.fwCtrl = FWCtrlShared();
+        QMKMark(@"colorpick_injected"); // 键条注入成功标记
     } @catch (NSException *e) {}
 }
 
@@ -264,124 +380,63 @@ static QMKExtraController *QMKController(void) {
     return c;
 }
 
-// ---- 功能键条构建 (幂等) ----
-static void QMKInstallBar(UIViewController *vc) {
+static id FWCtrlShared(void) {
     @try {
-        UIView *root = vc.view;
-        if (!root) return;
-        if ([root viewWithTag:QMK_BAR_TAG]) return;
-        CGFloat W = root.bounds.size.width;
-        CGFloat H = root.bounds.size.height;
-        if (W < 200 || H < 300) return;
-        CGFloat K = MIN(W / 390.0, H / 844.0);
+        Class fw = NSClassFromString(@"FWCtrl");
+        if (!fw) return nil;
+        return [fw performSelector:@selector(shared)];
+    } @catch (NSException *e) {}
+    return nil;
+}
 
-        UIColor *c1 = [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1.0]; // 极光青
-        UIColor *c2 = [UIColor colorWithRed:0.71 green:0.47 blue:1.0 alpha:1.0]; // 极光紫
-        UIColor *c3 = [UIColor colorWithRed:1.0 green:0.47 blue:0.78 alpha:1.0]; // 极光粉
-
-        // 增强键条: 位于底部双键之下
-        CGFloat barY = (402 * K + 44 * K + 8 * K);
-        CGFloat barH = 40 * K;
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12 * K, barY, W - 24 * K, barH)];
-        bar.tag = QMK_BAR_TAG;
-        bar.layer.cornerRadius = 14 * K;
-        bar.layer.borderWidth = 1;
-        bar.layer.borderColor = c2.CGColor;
-        bar.backgroundColor = [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.96];
-        bar.layer.shadowColor = [UIColor blackColor].CGColor;
-        bar.layer.shadowOpacity = 0.4f;
-        bar.layer.shadowOffset = CGSizeMake(0, 8 * K);
-        bar.layer.shadowRadius = 20 * K;
-
-        CGFloat bw = (bar.bounds.size.width - 16 * K - 10 * K) / 3;
-        CGFloat by = 5 * K;
-        CGFloat bh = barH - 10 * K;
-
-        // 取色键
-        UIButton *pick = [UIButton buttonWithType:UIButtonTypeCustom];
-        pick.frame = CGRectMake(8 * K, by, bw, bh);
-        pick.layer.cornerRadius = 10 * K;
-        pick.layer.borderWidth = 1;
-        pick.layer.borderColor = c1.CGColor;
-        pick.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
-        UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(10 * K, (bh - 12 * K) / 2, 12 * K, 12 * K)];
-        dot.tag = QMK_DOT_TAG;
-        dot.layer.cornerRadius = 6 * K;
-        dot.layer.borderWidth = 1;
-        dot.layer.borderColor = [UIColor whiteColor].CGColor;
-        dot.backgroundColor = [UIColor colorWithWhite:0.7 alpha:1.0];
-        [pick addSubview:dot];
-        UILabel *pl = [[UILabel alloc] initWithFrame:CGRectMake(28 * K, 0, bw - 30 * K, bh)];
-        pl.text = @"屏幕取色";
-        pl.font = [UIFont boldSystemFontOfSize:10 * K];
-        pl.textColor = [UIColor whiteColor];
-        [pick addSubview:pl];
-        [pick addTarget:QMKController() action:@selector(startPick:) forControlEvents:UIControlEventTouchUpInside];
-        [bar addSubview:pick];
-
-        // 旋转键
-        UIButton *rot = [UIButton buttonWithType:UIButtonTypeCustom];
-        rot.frame = CGRectMake(8 * K + bw + 5 * K, by, bw, bh);
-        rot.layer.cornerRadius = 10 * K;
-        rot.layer.borderWidth = 1;
-        rot.layer.borderColor = c3.CGColor;
-        rot.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
-        UILabel *rl = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, bw, bh)];
-        rl.font = [UIFont boldSystemFontOfSize:10 * K];
-        rl.textColor = [UIColor whiteColor];
-        rl.textAlignment = NSTextAlignmentCenter;
-        [rot addSubview:rl];
-        [rot addTarget:QMKController() action:@selector(rotateTapped) forControlEvents:UIControlEventTouchUpInside];
-        [bar addSubview:rot];
-        QMKController().rotateButton = rot;
-        QMKController().rotateLabel = rl;
-
-        // 日志键
-        UIButton *log = [UIButton buttonWithType:UIButtonTypeCustom];
-        log.frame = CGRectMake(8 * K + 2 * (bw + 5 * K), by, bw, bh);
-        log.layer.cornerRadius = 10 * K;
-        log.layer.borderWidth = 1;
-        log.layer.borderColor = c2.CGColor;
-        log.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.7];
-        UILabel *ll = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, bw, bh)];
-        ll.text = @"安装日志";
-        ll.font = [UIFont boldSystemFontOfSize:10 * K];
-        ll.textColor = [UIColor whiteColor];
-        ll.textAlignment = NSTextAlignmentCenter;
-        [log addSubview:ll];
-        [log addTarget:QMKController() action:@selector(logTapped) forControlEvents:UIControlEventTouchUpInside];
-        [bar addSubview:log];
-
-        [root addSubview:bar];
-        [QMKController() updateRotateLabel];
-        [QMKController() refreshPickDot];
-        QMKMark(@"colorpick_injected"); // 取色功能键/悬浮窗注入成功
+// ---- FWCtrl.togglePanel swizzle: 面板开关时同步增强键条 ----
+static void (*QMKToggleOrig)(id, SEL) = NULL;
+static void QMKToggleHook(id self, SEL _cmd) {
+    if (QMKToggleOrig) QMKToggleOrig(self, _cmd);
+    @try {
+        if (!QMKIsSpringBoard()) return;
+        UIView *panel = [self valueForKey:@"_panel"];
+        if (!panel) return;
+        BOOL visible = !panel.hidden;
+        QMKController().fwCtrl = self;
+        if (visible) {
+            [QMKController() installBarNearPanel:panel];
+        } else {
+            if (QMKController().bar) QMKController().bar.hidden = YES;
+        }
     } @catch (NSException *e) {}
 }
 
-// ---- 挂载 (swizzle + 延迟重试, 与 VCamUIPatch 同模式) ----
+// ---- 唤起悬浮球 (v6.3.4 设计性隐藏, 用户需求恢复; 仅 SpringBoard, 幂等) ----
+static void QMKShowFloatBall(void) {
+    @try {
+        if (!QMKIsSpringBoard()) return;
+        static BOOL shown = NO;
+        if (shown) return;
+        id fw = FWCtrlShared();
+        if (!fw) return;
+        if ([fw respondsToSelector:@selector(doShow)]) {
+            [fw performSelector:@selector(doShow)];
+            shown = YES;
+        }
+    } @catch (NSException *e) {}
+}
+
+// ---- 挂载 (FWCtrl 真实类 + 延迟重试, 与 vcam 加载时序解耦) ----
 static BOOL QMKInstalled = NO;
-static void (*QMKOrigViewDidLoad)(id, SEL) = NULL;
-
-static void QMKViewDidLoad(id self, SEL _cmd) {
-    if (QMKOrigViewDidLoad) QMKOrigViewDidLoad(self, _cmd);
-    @try {
-        QMKController().host = (UIViewController *)self;
-        QMKInstallBar((UIViewController *)self);
-    } @catch (NSException *e) {}
-}
 
 static void QMKInstallSwizzles(void) {
     if (QMKInstalled) return;
-    Class settings = NSClassFromString(@"VCamSettingsViewController");
-    if (!settings) return; // 类未加载, 由重试调度补装
-    Method m = class_getInstanceMethod(settings, @selector(viewDidLoad));
+    Class fw = NSClassFromString(@"FWCtrl");
+    if (!fw) return; // 类未加载, 由重试调度补装
+    Method m = class_getInstanceMethod(fw, @selector(togglePanel));
     if (!m) return;
-    QMKOrigViewDidLoad = (void (*)(id, SEL))method_getImplementation(m);
-    if (!class_addMethod(settings, @selector(viewDidLoad), (IMP)QMKViewDidLoad, method_getTypeEncoding(m))) {
-        method_setImplementation(m, (IMP)QMKViewDidLoad);
+    QMKToggleOrig = (void (*)(id, SEL))method_getImplementation(m);
+    if (!class_addMethod(fw, @selector(togglePanel), (IMP)QMKToggleHook, method_getTypeEncoding(m))) {
+        method_setImplementation(m, (IMP)QMKToggleHook);
     }
     QMKInstalled = YES;
+    QMKShowFloatBall();
 }
 
 __attribute__((constructor))
@@ -394,6 +449,9 @@ static void QMKInit(void) {
                 QMKInstallSwizzles();
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     QMKInstallSwizzles();
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        QMKInstallSwizzles();
+                    });
                 });
             });
         });
