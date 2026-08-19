@@ -19,6 +19,8 @@
 //   B3) 首帧日志含格式; 每60帧报数; 10s看门狗; 90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
+// E) 黑屏修复: 旋转缓存 4->16 + 淘汰延迟 2s 释放 (引擎异步渲染滞后数帧持野指针 -> 黑屏)
+// F) 体积优化: 融合 deb 数据成员 data.tar.xz (xz 压缩, 安装更快)
 // D) 输出 LV-7.deb
 #import <UIKit/UIKit.h>
 #import <CoreImage/CoreImage.h>
@@ -224,6 +226,8 @@ static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, N
 
 // 旋转帧缓存: 按源 buffer 指针缓存旋转结果, 多入口共享
 // (updateCurrentBuffer:/copyCurrentFrame:/getCurrentFrame:), 防重复旋转/重复分配
+// [黑屏修复] 引擎异步渲染可能滞后数帧, 淘汰即释放会让引擎持有野指针 -> 黑屏;
+// 故: 上限 16 + 淘汰仅摘引用, 延迟 2s 释放 (引擎必已换帧, 既防野指针又防泄漏)
 static NSMutableDictionary *gRotCache = nil;
 static NSMutableArray *gRotCacheKeys = nil;
 static CVPixelBufferRef QMKRotCached(CVBufferRef src, NSInteger rot) {
@@ -233,13 +237,18 @@ static CVPixelBufferRef QMKRotCached(CVBufferRef src, NSInteger rot) {
         NSValue *key = [NSValue valueWithPointer:src];
         NSValue *hit = gRotCache[key];
         if (hit) return (CVPixelBufferRef)[hit pointerValue];
-        while (gRotCacheKeys.count >= 4) {
+        while (gRotCacheKeys.count >= 16) {
             NSValue *old = gRotCacheKeys.firstObject;
             [gRotCacheKeys removeObjectAtIndex:0];
             NSValue *v = gRotCache[old];
             if (v) {
-                CVPixelBufferRelease((CVPixelBufferRef)[v pointerValue]);
                 [gRotCache removeObjectForKey:old];
+                CVPixelBufferRef doomed = (CVPixelBufferRef)[v pointerValue];
+                CFRetain(doomed);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    CVPixelBufferRelease(doomed);
+                });
             }
         }
         CVPixelBufferRef out = QMKApplyRotationPreservingFormat(src, rot);
