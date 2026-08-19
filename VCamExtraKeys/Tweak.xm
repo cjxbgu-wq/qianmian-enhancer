@@ -31,17 +31,12 @@ static NSString *const QMKErrorLogPath       = @"/tmp/qianmian_error.log";
 static NSString *const QMKRotationKey        = @"videoRotationLV";
 static NSString *const QMKLegacyRotationKey  = @"videoRotation";
 
-static const NSInteger QMK_TAG_POD  = 0x6E30;
 static const NSInteger QMK_TAG_ROT  = 0x6E31;
-static const NSInteger QMK_TAG_ENH  = 0x6E32;
 static const NSInteger QMK_TAG_LOG  = 0x6E33;
 static const NSInteger QMK_TAG_MED  = 0x6E34;
 static const NSInteger QMK_TAG_REP  = 0x6E35;
 static const NSInteger QMK_TAG_RST  = 0x6E36;
 static const NSInteger QMK_TAG_BAL  = 0x6E37;
-static const NSInteger QMK_TAG_RTM  = 0x6E38;
-static const NSInteger QMK_TAG_URL  = 0x6E39;
-static const NSInteger QMK_TAG_STT  = 0x6E3A;
 static const NSInteger QMK_TAG_TUT  = 0x6E3B;
 static const NSInteger QMK_TAG_CLS  = 0x6E3C;
 static const NSInteger QMK_TAG_COL  = 0x6E3D; // 彩色注入
@@ -634,35 +629,6 @@ static UIImage *QMKXIcon(UIColor *c) {
         CGContextSetLineCap(ctx, kCGLineCapRound);
         CGContextMoveToPoint(ctx, 13, 13); CGContextAddLineToPoint(ctx, 35, 35); CGContextStrokePath(ctx);
         CGContextMoveToPoint(ctx, 35, 13); CGContextAddLineToPoint(ctx, 13, 35); CGContextStrokePath(ctx);
-    });
-}
-
-static UIImage *QMKColorIcon(UIColor *c) {
-    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
-        // 彩色注入: 三色环 (取色映射语义)
-        UIColor *c2 = [UIColor colorWithRed:1.0 green:0.47 blue:0.78 alpha:1];
-        UIColor *c3 = [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1];
-        CGContextSetLineWidth(ctx, 4);
-        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
-        CGContextStrokeEllipseInRect(ctx, CGRectMake(6, 6, 36, 36));
-        CGContextSetFillColorWithColor(ctx, c.CGColor);
-        CGContextFillEllipseInRect(ctx, CGRectMake(19, 19, 10, 10));
-        CGContextSetFillColorWithColor(ctx, c2.CGColor);
-        CGContextFillEllipseInRect(ctx, CGRectMake(6, 6, 8, 8));
-        CGContextSetFillColorWithColor(ctx, c3.CGColor);
-        CGContextFillEllipseInRect(ctx, CGRectMake(34, 34, 8, 8));
-    });
-}
-
-static UIImage *QMKRotateIcon(UIColor *c) {
-    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
-        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
-        CGContextSetLineWidth(ctx, 3);
-        CGContextSetLineCap(ctx, kCGLineCapRound);
-        CGContextAddArc(ctx, 24, 24, 16, 0.15 * M_PI, 1.85 * M_PI, 0);
-        CGContextStrokePath(ctx);
-        CGContextMoveToPoint(ctx, 39, 10); CGContextAddLineToPoint(ctx, 42, 2);
-        CGContextAddLineToPoint(ctx, 34, 5); CGContextStrokePath(ctx);
     });
 }
 
