@@ -1,10 +1,17 @@
-// VCamExtraKeys v8 (LV-6) - 统一功能舱 v3 (vcam 核心/UI补丁/增强模块 零改动)
-// 面板层 (继承 v7):
-//   A1) 无界扫描(迭代栈)收集面板条目: 标题标签 → responder 链(≤6跳)命中
-//       VCamSettingsViewController → vc 条目; 未命中 → 容器兜底条目
-//   A2) 主面板 = 可见 vc 条目中 (windowLevel 最高, 其次最新); 容器条目永不为主
-//   A3) 非主 vc 面板整面隐藏 + 其专用面板窗(level>normal 且非主窗)整窗隐藏 — 双保险
-//   A4) 键转发仅放行 VCamSettingsViewController 类实例 + @try 保护 (防崩溃黑屏)
+// VCamExtraKeys v9 (LV-7) - 统一功能舱 v3 (vcam 核心/UI补丁/增强模块 零改动)
+// 面板层 (整面重建模式, 根治旧面板残留):
+//   A1) 接管 VCamSettingsViewController viewDidLoad: 原逻辑先跑, 然后同步销毁
+//       全部旧可见面板实例 (view 摘除 + 独立面板窗隐藏), 最后整面重建新面板 —
+//       旧实例在"新面板出现瞬间"即销毁, 不再有"短暂停留后跳到新面板"
+//   A2) QMKBuildPanel 照源码/补丁 VPBuildPanel 布局与调用逻辑逐行移植:
+//       标题胶囊/左主控舱(2x2 原图标键: 媒体/替换/恢复/悬浮球)/迷你RTMP镜像
+//       (开关+输入)/右状态舱(眼瞳+徽章+RTMP开关)/底部教程+关闭 — 按钮 target
+//       一律 = 面板 VC + 原 SEL (switchVideoTapped 等), 调用逻辑零改动;
+//       徽章/RTMP tag 与补丁一致 (0x6B62/0x6B65/0x6B66/0x6B67) → 补丁的
+//       updateStatusLabel 状态同步直接作用于我方 UI
+//   A3) 新增键: 视频旋转 (qmkRotTapped: -> QMKCycleRotation) +
+//       彩色注入 (qmkColorTapped: -> QMEnhancerView 屏幕取色映射 toggle)
+//   A4) tick 兜底: 主面板根无构建标记(0x6E50) -> 重建; 非主可见实例 -> 销毁
 // 旋转层 (对齐旧项目 UI源码界面虚浮窗功能):
 //   B1) 旋转结果保持源格式 (420v/420f/BGRA), 不再固定输出 BGRA — 核心 YUV 管线兼容
 //   B2) 消费点全覆盖: 除 updateCurrentBuffer: 外再钩 copyCurrentFrame/getCurrentFrame
@@ -12,10 +19,11 @@
 //   B3) 首帧日志含格式; 每60帧报数; 10s看门狗; 90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
-// D) 输出 LV-6.deb
+// D) 输出 LV-7.deb
 #import <UIKit/UIKit.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
 static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
@@ -36,11 +44,14 @@ static const NSInteger QMK_TAG_URL  = 0x6E39;
 static const NSInteger QMK_TAG_STT  = 0x6E3A;
 static const NSInteger QMK_TAG_TUT  = 0x6E3B;
 static const NSInteger QMK_TAG_CLS  = 0x6E3C;
+static const NSInteger QMK_TAG_COL  = 0x6E3D; // 彩色注入
+static const NSInteger QMK_TAG_OWN  = 0x6E50; // 我方整面重建的构建标记 (根视图)
 
-static const NSInteger VP_TAG_BADGE   = 0x6B62;
-static const NSInteger VP_TAG_MINISW  = 0x6B65;
-static const NSInteger VP_TAG_MINITF  = 0x6B66;
-static const NSInteger VP_TAG_RTMPSW  = 0x6B67;
+static const NSInteger VP_TAG_BADGE    = 0x6B62;
+static const NSInteger VP_TAG_BALLIMG  = 0x6B63;
+static const NSInteger VP_TAG_MINISW   = 0x6B65;
+static const NSInteger VP_TAG_MINITF   = 0x6B66;
+static const NSInteger VP_TAG_RTMPSW   = 0x6B67;
 
 typedef NS_ENUM(NSInteger, QMKProcess) {
     QMKProcessOther = 0,
@@ -429,94 +440,12 @@ static void QMKScheduleFrameInstall(void) {
     QMKScheduleFrameWatchdog();
 }
 
-static void QMKUrlCommit(UIViewController *vc);
-
 @interface QMKExtraController : NSObject
 @property (nonatomic, weak) UIViewController *panelVC;
 @property (nonatomic, weak) UIButton *rotBtn;
-@property (nonatomic, weak) UILabel *sttRep;
-@property (nonatomic, weak) UILabel *sttRtmp;
-- (void)keyTapped:(UIButton *)sender;
-- (void)urlEditingEnd:(UITextField *)sender;
 @end
 
 @implementation QMKExtraController
-
-- (void)keyTapped:(UIButton *)sender {
-    if (!sender) return;
-    @try {
-        switch (sender.tag) {
-            case QMK_TAG_ROT: {
-                NSInteger next = QMKCycleRotation();
-                [self.rotBtn setTitle:[NSString stringWithFormat:@"🔄\n旋转 %ld°", (long)next]
-                             forState:UIControlStateNormal];
-                break;
-            }
-            case QMK_TAG_ENH: {
-                Class enh = NSClassFromString(@"QMEnhancerView");
-                if (!enh) { QMKWarn(@"增强面板: 增强模块未加载"); break; }
-                id inst = QMKSafeCall(enh, @selector(sharedInstance), nil);
-                if (inst && [inst respondsToSelector:@selector(togglePanel)]) {
-                    QMKSafeCall(inst, @selector(togglePanel), nil);
-                    QMKInfo(@"增强面板: 展开/收起已切换");
-                } else {
-                    QMKWarn(@"增强面板: 切换失败 (增强单例不可用)");
-                }
-                break;
-            }
-            case QMK_TAG_LOG: [self showLogAlert]; break;
-            case QMK_TAG_MED: [self forwardSel:@selector(switchVideoTapped)]; break;
-            case QMK_TAG_REP: [self forwardSel:@selector(toggleReplacementTapped)]; break;
-            case QMK_TAG_RST: [self forwardSel:@selector(restoreCameraTapped)]; break;
-            case QMK_TAG_BAL: [self forwardSel:@selector(toggleFloatingBallTapped)]; break;
-            case QMK_TAG_RTM: [self toggleRtmp]; break;
-            case QMK_TAG_TUT: [self forwardSel:@selector(openTutorial)]; break;
-            case QMK_TAG_CLS: [self forwardSel:@selector(dismissPanel)]; break;
-            default: break;
-        }
-    } @catch (NSException *e) { QMKErr(@"key-tapped", e); }
-}
-
-- (void)forwardSel:(SEL)sel {
-    UIViewController *vc = self.panelVC;
-    Class cls = NSClassFromString(@"VCamSettingsViewController");
-    // 类校验 + 可见性校验: 只转发给可见的活面板 (防陈旧/已收起实例触发核心动作导致崩溃黑屏)
-    if (!vc || (cls && ![vc isKindOfClass:cls]) || ![vc respondsToSelector:sel]) {
-        QMKWarn([NSString stringWithFormat:@"面板 VC 不可用或方法缺失: %@",
-                 NSStringFromSelector(sel)]);
-        return;
-    }
-    UIView *rv = vc.view;
-    if (!rv || rv.hidden || !rv.window) {
-        QMKWarn([NSString stringWithFormat:@"面板 VC 不可见, 拒绝转发: %@",
-                 NSStringFromSelector(sel)]);
-        return;
-    }
-    @try {
-        QMKSafeCall(vc, sel, nil);
-        QMKInfo([NSString stringWithFormat:@"已触发原功能: %@", NSStringFromSelector(sel)]);
-    } @catch (NSException *e) {
-        QMKErr(@"forward", e);
-        QMKWarn([NSString stringWithFormat:@"原功能触发异常: %@", NSStringFromSelector(sel)]);
-    }
-}
-
-- (void)toggleRtmp {
-    UIViewController *vc = self.panelVC;
-    UIView *root = vc ? vc.view : nil;
-    UISwitch *miniSw = (UISwitch *)[root viewWithTag:VP_TAG_MINISW];
-    if (![miniSw isKindOfClass:[UISwitch class]]) {
-        QMKWarn(@"RTMP 键: 补丁 miniSw 未找到 (0x6B65)");
-        return;
-    }
-    [miniSw setOn:!miniSw.isOn animated:YES];
-    [miniSw sendActionsForControlEvents:UIControlEventValueChanged];
-    QMKInfo([NSString stringWithFormat:@"RTMP 已切换: %@", miniSw.isOn ? @"ON" : @"OFF"]);
-}
-
-- (void)urlEditingEnd:(UITextField *)sender {
-    QMKUrlCommit(self.panelVC);
-}
 
 - (void)showLogAlert {
     @try {
@@ -576,174 +505,593 @@ static QMKExtraController *QMKController(void) {
     return c;
 }
 
-static UIButton *QMKKeyButton(NSString *title, NSInteger tag, UIColor *border,
-                              UIView *parent, CGRect frame) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.tag = tag;
-    b.frame = frame;
-    b.layer.cornerRadius = 16;
-    b.layer.borderWidth = 1.5;
-    b.layer.borderColor = border.CGColor;
-    b.backgroundColor = [UIColor colorWithRed:0.10 green:0.16 blue:0.27 alpha:0.55];
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:10];
-    b.titleLabel.numberOfLines = 2;
-    b.titleLabel.textAlignment = NSTextAlignmentCenter;
-    b.titleLabel.adjustsFontSizeToFitWidth = YES;
-    b.titleLabel.minimumScaleFactor = 0.6;
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [b addTarget:QMKController() action:@selector(keyTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [parent addSubview:b];
-    return b;
+static NSArray *QMKFindAllPanelEntries(void); // 前置声明 (定义在下方)
+
+// ---------------------------------------------------------------
+// 面板整面重建 (v9/LV-7): 照源码/补丁 VPBuildPanel 布局与调用逻辑逐行移植,
+// 按钮 target 一律 = 面板 VC + 原 SEL, 调用逻辑零改动; 徽章/RTMP tag 与补丁
+// 一致 (0x6B62/0x6B65/0x6B66/0x6B67) → 补丁 updateStatusLabel 状态同步直通
+// ---------------------------------------------------------------
+static UIColor *QMKColorGreen(void) { return [UIColor colorWithRed:0.24 green:1.00 blue:0.62 alpha:1]; }
+static UIColor *QMKColorBlue(void)  { return [UIColor colorWithRed:0.24 green:0.48 blue:1.00 alpha:1]; }
+static UIColor *QMKColorPink(void)  { return [UIColor colorWithRed:1.00 green:0.24 blue:0.62 alpha:1]; }
+static UIColor *QMKColorGold(void)  { return [UIColor colorWithRed:1.00 green:0.77 blue:0.24 alpha:1]; }
+static UIColor *QMKColorGlass(void) { return [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.5]; }
+
+@interface QMKPressButton : UIButton
+@end
+@implementation QMKPressButton
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesBegan:touches withEvent:event];
+    [UIView animateWithDuration:0.08 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.transform = CGAffineTransformMakeScale(0.9, 0.9);
+        self.alpha = 0.85;
+    } completion:nil];
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesEnded:touches withEvent:event];
+    [UIView animateWithDuration:0.16 delay:0 usingSpringWithDamping:0.55 initialSpringVelocity:0.8
+                        options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.transform = CGAffineTransformIdentity;
+        self.alpha = 1.0;
+    } completion:nil];
+}
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesCancelled:touches withEvent:event];
+    self.transform = CGAffineTransformIdentity;
+    self.alpha = 1.0;
+}
+@end
+
+static UIImage *QMKRenderIcon(CGSize size, void (^draw)(CGContextRef ctx)) {
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.scale = 3;
+    UIGraphicsImageRenderer *ren = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+    return [ren imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        if (draw) draw(ctx.CGContext);
+    }];
 }
 
-static void QMKAttachUnifiedPod(UIViewController *vc) {
-    @try {
-        UIView *root = vc.view;
-        if (!root || [root viewWithTag:QMK_TAG_POD]) return;
-        CGFloat W = root.bounds.size.width;
-        CGFloat H = root.bounds.size.height;
-        if (W < 100 || H < 100) return;
-        CGFloat K = MIN(W / 390.0, H / 844.0);
-
-        UIColor *green  = [UIColor colorWithRed:0.24 green:1.0  blue:0.62 alpha:1.0];
-        UIColor *blue   = [UIColor colorWithRed:0.24 green:0.48 blue:1.0  alpha:1.0];
-        UIColor *pink   = [UIColor colorWithRed:1.0  green:0.24 blue:0.62 alpha:1.0];
-        UIColor *gold   = [UIColor colorWithRed:1.0  green:0.77 blue:0.24 alpha:1.0];
-        UIColor *teal   = [UIColor colorWithRed:0.31 green:0.86 blue:1.0  alpha:1.0];
-        UIColor *purple = [UIColor colorWithRed:0.71 green:0.47 blue:1.0  alpha:1.0];
-        UIColor *red    = [UIColor colorWithRed:1.0  green:0.36 blue:0.36 alpha:1.0];
-        UIColor *slate  = [UIColor colorWithRed:0.49 green:0.61 blue:0.84 alpha:1.0];
-
-        // 全量隐藏原面板控件 (标题/双舱/教程/关闭), 仅保留我方统一舱;
-        // 补丁每次 viewDidLoad 重建后, 下轮 tick 会重新隐藏 (幂等)
-        for (UIView *v in root.subviews) v.hidden = YES;
-        UISwitch *miniSw = (UISwitch *)[root viewWithTag:VP_TAG_MINISW];
-        UISwitch *rtmpSw = (UISwitch *)[root viewWithTag:VP_TAG_RTMPSW];
-        if (![miniSw isKindOfClass:[UISwitch class]]) QMKWarn(@"原 miniSw 未找到 (0x6B65)");
-        if (![rtmpSw isKindOfClass:[UISwitch class]]) QMKWarn(@"原 rtmpSw 未找到 (0x6B67)");
-
-        UIView *pod = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 88 * K, 366 * K, 344 * K)];
-        pod.tag = QMK_TAG_POD;
-        pod.layer.cornerRadius = 22 * K;
-        pod.layer.borderWidth = 1.5;
-        pod.layer.borderColor = green.CGColor;
-        pod.backgroundColor = [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.6];
-        pod.layer.shadowColor = [UIColor blackColor].CGColor;
-        pod.layer.shadowOpacity = 0.4f;
-        pod.layer.shadowOffset = CGSizeMake(0, 12 * K);
-        pod.layer.shadowRadius = 32 * K;
-
-        UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(14 * K, 12 * K, 120 * K, 12 * K)];
-        pt.text = @"功能舱";
-        pt.font = [UIFont boldSystemFontOfSize:9 * K];
-        pt.textColor = green;
-        [pod addSubview:pt];
-
-        CGFloat kw = (366 * K - 28 * K - 40 * K) / 5;
-        CGFloat kh = 80 * K;
-        CGFloat ky1 = 30 * K, ky2 = 120 * K;
-        NSArray *defs = @[
-            @{@"t": @"🎞️\n媒体切换", @"tag": @(QMK_TAG_MED), @"c": green},
-            @{@"t": @"👁️\n替换",     @"tag": @(QMK_TAG_REP), @"c": blue},
-            @{@"t": @"↩️\n恢复相机",  @"tag": @(QMK_TAG_RST), @"c": pink},
-            @{@"t": @"🟠\n悬浮球",    @"tag": @(QMK_TAG_BAL), @"c": gold},
-            @{@"t": [NSString stringWithFormat:@"🔄\n旋转 %ld°", (long)QMKReadRotation()],
-              @"tag": @(QMK_TAG_ROT), @"c": teal},
-            @{@"t": @"🧪\n增强面板",  @"tag": @(QMK_TAG_ENH), @"c": purple},
-            @{@"t": @"📋\n错误日志",  @"tag": @(QMK_TAG_LOG), @"c": red},
-            @{@"t": [NSString stringWithFormat:@"📡\nRTMP %@", (miniSw && miniSw.isOn) ? @"ON" : @"OFF"],
-              @"tag": @(QMK_TAG_RTM), @"c": slate},
-            @{@"t": @"📖\n教程",     @"tag": @(QMK_TAG_TUT), @"c": blue},
-            @{@"t": @"✖️\n关闭",     @"tag": @(QMK_TAG_CLS), @"c": pink},
-        ];
-        for (int i = 0; i < 10; i++) {
-            int col = i % 5, row = i / 5;
-            CGRect f = CGRectMake((14 + col * (kw + 10)) * K,
-                                  (row == 0 ? ky1 : ky2) * K, kw, kh);
-            UIButton *b = QMKKeyButton(defs[i][@"t"], [defs[i][@"tag"] integerValue],
-                                       defs[i][@"c"], pod, f);
-            if (b.tag == QMK_TAG_ROT) QMKController().rotBtn = b;
-        }
-
-        UITextField *miniTf = (UITextField *)[root viewWithTag:VP_TAG_MINITF];
-        UITextField *url = [[UITextField alloc] initWithFrame:CGRectMake(14 * K, 214 * K, 338 * K, 26 * K)];
-        url.tag = QMK_TAG_URL;
-        url.font = [UIFont systemFontOfSize:9 * K];
-        url.textColor = [UIColor colorWithRed:0.81 green:0.88 blue:1 alpha:1];
-        url.backgroundColor = [UIColor colorWithRed:0.24 green:0.48 blue:1 alpha:0.15];
-        url.layer.cornerRadius = 7 * K;
-        url.layer.borderWidth = 1;
-        url.layer.borderColor = blue.CGColor;
-        url.keyboardType = UIKeyboardTypeURL;
-        url.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        url.returnKeyType = UIReturnKeyDone;
-        url.attributedPlaceholder = [[NSAttributedString alloc]
-            initWithString:@"rtmp://推流地址…"
-            attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.35]}];
-        if ([miniTf isKindOfClass:[UITextField class]]) url.text = miniTf.text;
-        [url addTarget:QMKController() action:@selector(urlEditingEnd:) forControlEvents:UIControlEventEditingDidEnd];
-        [url addTarget:QMKController() action:@selector(urlEditingEnd:) forControlEvents:UIControlEventEditingDidEndOnExit];
-        [pod addSubview:url];
-
-        [root addSubview:pod];
-
-        UIView *stt = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 490 * K, 366 * K, 44 * K)];
-        stt.tag = QMK_TAG_STT;
-        stt.layer.cornerRadius = 14 * K;
-        stt.layer.borderWidth = 1.5;
-        stt.layer.borderColor = blue.CGColor;
-        stt.backgroundColor = [UIColor colorWithRed:0.063 green:0.102 blue:0.173 alpha:0.6];
-        UILabel *rep = [[UILabel alloc] initWithFrame:CGRectMake(20 * K, 0, 160 * K, 44 * K)];
-        rep.tag = QMK_TAG_STT + 1;
-        rep.textColor = green;
-        rep.font = [UIFont boldSystemFontOfSize:11 * K];
-        [stt addSubview:rep];
-        UILabel *rtm = [[UILabel alloc] initWithFrame:CGRectMake(190 * K, 0, 160 * K, 44 * K)];
-        rtm.tag = QMK_TAG_STT + 2;
-        rtm.textColor = slate;
-        rtm.font = [UIFont boldSystemFontOfSize:11 * K];
-        [stt addSubview:rtm];
-        [root addSubview:stt];
-        QMKController().sttRep = rep;
-        QMKController().sttRtmp = rtm;
-
-        QMKInfo(@"统一功能舱已挂载 (10 键 + RTMP 输入 + 状态条, 原面板控件已隐藏)");
-    } @catch (NSException *e) { QMKErr(@"pod-attach", e); }
+static UIImage *QMKFilmIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetFillColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGRect body = CGRectMake(5, 9, 38, 26);
+        CGPathRef p = CGPathCreateWithRoundedRect(body, 4, 4, NULL);
+        CGContextAddPath(ctx, p); CGContextStrokePath(ctx);
+        CGPathRelease(p);
+        CGContextMoveToPoint(ctx, 19, 9); CGContextAddLineToPoint(ctx, 19, 35); CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 28, 17); CGContextAddLineToPoint(ctx, 40, 23); CGContextAddLineToPoint(ctx, 28, 29);
+        CGContextClosePath(ctx); CGContextFillPath(ctx);
+    });
 }
 
-static void QMKRefreshStatus(UIViewController *vc) {
-    @try {
-        UIView *root = vc ? vc.view : nil;
-        QMKExtraController *c = QMKController();
-        UILabel *badge = (UILabel *)[root viewWithTag:VP_TAG_BADGE];
-        if (c.sttRep && [badge isKindOfClass:[UILabel class]] && badge.text.length) {
-            c.sttRep.text = [NSString stringWithFormat:@"👁️ 替换 %@", badge.text];
-        }
-        UISwitch *miniSw = (UISwitch *)[root viewWithTag:VP_TAG_MINISW];
-        if (c.sttRtmp) {
-            BOOL on = [miniSw isKindOfClass:[UISwitch class]] && miniSw.isOn;
-            c.sttRtmp.text = [NSString stringWithFormat:@"📡 RTMP %@", on ? @"ON" : @"OFF"];
-            UIButton *rtm = (UIButton *)[root viewWithTag:QMK_TAG_RTM];
-            if (rtm) [rtm setTitle:[NSString stringWithFormat:@"📡\nRTMP %@", on ? @"ON" : @"OFF"]
-                          forState:UIControlStateNormal];
-        }
-    } @catch (NSException *e) { QMKErr(@"status-refresh", e); }
+static UIImage *QMKEyeIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetFillColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGMutablePathRef p = CGPathCreateMutable();
+        CGPathMoveToPoint(p, NULL, 3, 24);
+        CGPathAddCurveToPoint(p, NULL, 8.5, 15, 14, 10.5, 24, 10.5);
+        CGPathAddCurveToPoint(p, NULL, 34, 10.5, 39.5, 15, 45, 24);
+        CGPathAddCurveToPoint(p, NULL, 39.5, 33, 34, 37.5, 24, 37.5);
+        CGPathAddCurveToPoint(p, NULL, 14, 37.5, 8.5, 33, 3, 24);
+        CGPathCloseSubpath(p);
+        CGContextAddPath(ctx, p); CGContextStrokePath(ctx);
+        CGPathRelease(p);
+        CGContextFillEllipseInRect(ctx, CGRectMake(17, 17, 14, 14));
+    });
 }
 
-static void QMKUrlCommit(UIViewController *vc) {
-    @try {
-        UIView *root = vc ? vc.view : nil;
-        UITextField *miniTf = (UITextField *)[root viewWithTag:VP_TAG_MINITF];
-        UITextField *ours = (UITextField *)[root viewWithTag:QMK_TAG_URL];
-        if (![miniTf isKindOfClass:[UITextField class]] ||
-            ![ours isKindOfClass:[UITextField class]]) return;
-        if (![miniTf.text isEqualToString:ours.text]) {
-            miniTf.text = ours.text;
-            [miniTf sendActionsForControlEvents:UIControlEventEditingDidEnd];
-            QMKInfo(@"RTMP 地址已提交");
+static UIImage *QMKRestoreIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextSetLineJoin(ctx, kCGLineJoinRound);
+        CGContextAddArc(ctx, 30, 24, 16, 0.35 * M_PI, 1.45 * M_PI, 0);
+        CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 14, 8); CGContextAddLineToPoint(ctx, 14, 20); CGContextAddLineToPoint(ctx, 26, 20);
+        CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 46, 40); CGContextAddLineToPoint(ctx, 38, 32); CGContextStrokePath(ctx);
+    });
+}
+
+static UIImage *QMKOrbitIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetFillColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(15, 15, 18, 18));
+        CGContextFillEllipseInRect(ctx, CGRectMake(21, 21, 6, 6));
+        CGContextMoveToPoint(ctx, 24, 4);  CGContextAddLineToPoint(ctx, 24, 10);  CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 24, 38); CGContextAddLineToPoint(ctx, 24, 44);  CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 4, 24);  CGContextAddLineToPoint(ctx, 10, 24);  CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 38, 24); CGContextAddLineToPoint(ctx, 44, 24);  CGContextStrokePath(ctx);
+    });
+}
+
+static UIImage *QMKBookIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGContextSetLineJoin(ctx, kCGLineJoinRound);
+        CGPathRef p = CGPathCreateWithRoundedRect(CGRectMake(8, 8, 22, 30), 4, 4, NULL);
+        CGContextAddPath(ctx, p); CGContextStrokePath(ctx); CGPathRelease(p);
+        CGContextMoveToPoint(ctx, 30, 8); CGContextAddLineToPoint(ctx, 37, 10);
+        CGContextAddLineToPoint(ctx, 40, 12); CGContextAddLineToPoint(ctx, 40, 38);
+        CGContextAddLineToPoint(ctx, 30, 38); CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 30, 8); CGContextAddLineToPoint(ctx, 30, 38); CGContextStrokePath(ctx);
+    });
+}
+
+static UIImage *QMKXIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextMoveToPoint(ctx, 13, 13); CGContextAddLineToPoint(ctx, 35, 35); CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 35, 13); CGContextAddLineToPoint(ctx, 13, 35); CGContextStrokePath(ctx);
+    });
+}
+
+static UIImage *QMKColorIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        // 彩色注入: 三色环 (取色映射语义)
+        UIColor *c2 = [UIColor colorWithRed:1.0 green:0.47 blue:0.78 alpha:1];
+        UIColor *c3 = [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1];
+        CGContextSetLineWidth(ctx, 4);
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(6, 6, 36, 36));
+        CGContextSetFillColorWithColor(ctx, c.CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(19, 19, 10, 10));
+        CGContextSetFillColorWithColor(ctx, c2.CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(6, 6, 8, 8));
+        CGContextSetFillColorWithColor(ctx, c3.CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(34, 34, 8, 8));
+    });
+}
+
+static UIImage *QMKRotateIcon(UIColor *c) {
+    return QMKRenderIcon(CGSizeMake(48, 48), ^(CGContextRef ctx){
+        CGContextSetStrokeColorWithColor(ctx, c.CGColor);
+        CGContextSetLineWidth(ctx, 3);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextAddArc(ctx, 24, 24, 16, 0.15 * M_PI, 1.85 * M_PI, 0);
+        CGContextStrokePath(ctx);
+        CGContextMoveToPoint(ctx, 39, 10); CGContextAddLineToPoint(ctx, 42, 2);
+        CGContextAddLineToPoint(ctx, 34, 5); CGContextStrokePath(ctx);
+    });
+}
+
+// ---------------------------------------------------------------
+// 附加动作 (运行时注册到 VCamSettingsViewController, 照补丁镜像逻辑)
+// ---------------------------------------------------------------
+static Ivar QMKIvar(Class cls, const char *name) {
+    return class_getInstanceVariable(cls, name);
+}
+static void QMKMirrorRtmpState(UIViewController *vc, BOOL on, NSString *url) {
+    Class cls = object_getClass(vc);
+    Ivar swIv = QMKIvar(cls, "_rtmpSwitch");
+    Ivar tfIv = QMKIvar(cls, "_rtmpTextField");
+    if (swIv) {
+        UISwitch *origSw = object_getIvar(vc, swIv);
+        if (origSw) {
+            origSw.on = on;
+            QMKSafeCall(vc, @selector(rtmpSwitchChanged:), origSw);
         }
-    } @catch (NSException *e) { QMKErr(@"url-commit", e); }
+    }
+    if (tfIv && url.length) {
+        UITextField *origTf = object_getIvar(vc, tfIv);
+        if (origTf) {
+            origTf.text = url;
+            QMKSafeCall(vc, @selector(saveRtmpUrl), nil);
+        }
+    }
+}
+
+static void qmkMiniSwitchChanged(id self, SEL _cmd, id sender) {
+    UISwitch *sw = sender;
+    QMKMirrorRtmpState((UIViewController *)self, sw.isOn, nil);
+}
+static void qmkMiniTfEnd(id self, SEL _cmd, id sender) {
+    UITextField *tf = sender;
+    if (tf && tf.text.length) QMKMirrorRtmpState((UIViewController *)self, NO, tf.text);
+}
+static void qmkRtmpSwitchChanged(id self, SEL _cmd, id sender) {
+    UISwitch *sw = sender;
+    QMKMirrorRtmpState((UIViewController *)self, sw.isOn, nil);
+}
+static void qmkRotTapped(id self, SEL _cmd, id sender) {
+    NSInteger next = QMKCycleRotation();
+    UIButton *b = (UIButton *)sender;
+    if (b) {
+        [b setTitle:[NSString stringWithFormat:@"🔄\n旋转 %ld°", (long)next]
+           forState:UIControlStateNormal];
+    }
+    QMKInfo([NSString stringWithFormat:@"视频旋转 -> %ld°", (long)next]);
+}
+static void qmkColorTapped(id self, SEL _cmd, id sender) {
+    @try {
+        Class enh = NSClassFromString(@"QMEnhancerView");
+        if (!enh) { QMKWarn(@"彩色注入: 增强模块未加载"); return; }
+        BOOL on = NO;
+        if ([enh respondsToSelector:@selector(isColorMappingEnabled)]) {
+            NSNumber *n = QMKSafeCall(enh, @selector(isColorMappingEnabled), nil);
+            on = [n boolValue];
+        }
+        if (on) {
+            // 已启用 → 关闭彩色映射 (写增强模块共享设置)
+            if ([enh respondsToSelector:@selector(sharedSettings)] &&
+                [enh respondsToSelector:@selector(saveSharedSettings:)]) {
+                NSDictionary *cur = QMKSafeCall(enh, @selector(sharedSettings), nil);
+                NSMutableDictionary *s = [NSMutableDictionary dictionaryWithDictionary:cur ?: @{}];
+                s[@"colorMappingEnabled"] = @NO;
+                QMKSafeCall(enh, @selector(saveSharedSettings:), s);
+                QMKInfo(@"彩色注入: 已关闭");
+            }
+        } else {
+            // 未启用 → 展开增强面板并进入屏幕取色
+            id inst = QMKSafeCall(enh, @selector(sharedInstance), nil);
+            if (inst) {
+                if ([inst respondsToSelector:@selector(togglePanel)]) {
+                    QMKSafeCall(inst, @selector(togglePanel), nil);
+                }
+                if ([inst respondsToSelector:@selector(enterColorPickMode)]) {
+                    QMKSafeCall(inst, @selector(enterColorPickMode), nil);
+                }
+                QMKInfo(@"彩色注入: 进入屏幕取色 (增强面板已展开)");
+            }
+        }
+    } @catch (NSException *e) { QMKErr(@"color-inject", e); }
+}
+
+// ---------------------------------------------------------------
+// 整面重建 (照 VPBuildPanel 布局逐行移植 + 旋转/彩色新键)
+// ---------------------------------------------------------------
+static void QMKBuildPanel(UIViewController *vc) {
+    UIView *root = vc.view;
+    if (!root) return;
+    CGFloat W = root.bounds.size.width;
+    CGFloat H = root.bounds.size.height;
+    if (W < 100 || H < 100) return;
+    CGFloat K = MIN(W / 390.0, H / 844.0);
+
+    // 全量清除: 移除补丁产物与旧重建 (面板 UI 全部由我方重建)
+    for (UIView *v in [root.subviews copy]) [v removeFromSuperview];
+    root.tag = QMK_TAG_OWN;
+
+    // --- 标题胶囊 ---
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake((W - 200 * K) / 2, 46 * K, 200 * K, 30 * K)];
+    title.text = @"控制终端UI面板";
+    title.font = [UIFont boldSystemFontOfSize:13 * K];
+    title.textColor = [UIColor whiteColor];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.layer.cornerRadius = 15 * K;
+    title.layer.borderWidth = 1.5;
+    title.layer.borderColor = QMKColorGreen().CGColor;
+    title.backgroundColor = [UIColor colorWithRed:0.24 green:1.0 blue:0.62 alpha:0.15];
+    [root addSubview:title];
+
+    // --- 舱间光柱 ---
+    UIView *beam = [[UIView alloc] initWithFrame:CGRectMake(W / 2 + 19 * K, 172 * K, 6 * K, 118 * K)];
+    beam.layer.cornerRadius = 3 * K;
+    beam.backgroundColor = QMKColorGreen();
+    beam.alpha = 0.85;
+    [root addSubview:beam];
+    CABasicAnimation *bp = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    bp.fromValue = @0.85; bp.toValue = @0.3;
+    bp.duration = 1.4; bp.autoreverses = YES; bp.repeatCount = INFINITY;
+    [beam.layer addAnimation:bp forKey:@"qmkBeam"];
+
+    // --- 左主控舱 (2x2 原图标键 + 旋转/彩色 + 迷你RTMP) ---
+    UIView *podL = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 88 * K, 168 * K, 330 * K)];
+    podL.layer.cornerRadius = 22 * K;
+    podL.layer.borderWidth = 1.5;
+    podL.layer.borderColor = QMKColorGreen().CGColor;
+    podL.backgroundColor = QMKColorGlass();
+    podL.layer.shadowColor = [UIColor blackColor].CGColor;
+    podL.layer.shadowOpacity = 0.4f;
+    podL.layer.shadowOffset = CGSizeMake(0, 12 * K);
+    podL.layer.shadowRadius = 32 * K;
+    UIVisualEffectView *blurL = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+    blurL.frame = podL.bounds;
+    blurL.layer.cornerRadius = 22 * K;
+    blurL.layer.masksToBounds = YES;
+    [podL addSubview:blurL];
+    [root addSubview:podL];
+
+    UILabel *podTitle = [[UILabel alloc] initWithFrame:CGRectMake(14 * K, 12 * K, 100 * K, 12 * K)];
+    podTitle.text = @"主控舱";
+    podTitle.font = [UIFont boldSystemFontOfSize:9 * K];
+    podTitle.textColor = QMKColorGreen();
+    [podL addSubview:podTitle];
+
+    // 2x2 原图标键 (回调 = 原 SEL, 调用逻辑零改动)
+    CGFloat bw = (168 * K - 28 * K - 10 * K) / 2;
+    struct { SEL action; UIColor *color; UIImage *(*icon)(UIColor *); } keys[4] = {
+        { @selector(switchVideoTapped),        QMKColorGreen(), QMKFilmIcon },
+        { @selector(toggleReplacementTapped),  QMKColorBlue(),  QMKEyeIcon },
+        { @selector(restoreCameraTapped),      QMKColorPink(),  QMKRestoreIcon },
+        { @selector(toggleFloatingBallTapped), QMKColorGold(),  QMKOrbitIcon },
+    };
+    for (int i = 0; i < 4; i++) {
+        int col = i % 2, row = i / 2;
+        CGRect f = CGRectMake(14 * K + col * (bw + 10 * K), 30 * K + row * (74 * K + 12 * K), bw, 74 * K);
+        QMKPressButton *b = [QMKPressButton buttonWithType:UIButtonTypeCustom];
+        b.frame = f;
+        b.tag = (NSInteger[]){QMK_TAG_MED, QMK_TAG_REP, QMK_TAG_RST, QMK_TAG_BAL}[i];
+        b.layer.cornerRadius = 16 * K;
+        b.backgroundColor = keys[i].color;
+        b.layer.borderWidth = 1.5;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+        [b setImage:keys[i].icon([UIColor whiteColor]) forState:UIControlStateNormal];
+        b.imageView.contentMode = UIViewContentModeScaleAspectFit;
+        b.imageEdgeInsets = UIEdgeInsetsMake(11 * K, 11 * K, 11 * K, 11 * K);
+        [b addTarget:vc action:keys[i].action forControlEvents:UIControlEventTouchUpInside];
+        [podL addSubview:b];
+    }
+
+    // 新键行: 视频旋转 / 彩色注入
+    struct { SEL action; UIColor *color; NSInteger tag; NSString *title; } extra[2] = {
+        { @selector(qmkRotTapped:),   [UIColor colorWithRed:0.31 green:0.86 blue:1.0 alpha:1.0], QMK_TAG_ROT,
+          [NSString stringWithFormat:@"🔄\n旋转 %ld°", (long)QMKReadRotation()] },
+        { @selector(qmkColorTapped:), [UIColor colorWithRed:0.71 green:0.47 blue:1.0 alpha:1.0], QMK_TAG_COL,
+          @"🎨\n彩色注入" },
+    };
+    for (int i = 0; i < 2; i++) {
+        CGRect f = CGRectMake(14 * K + i * (bw + 10 * K), 212 * K, bw, 52 * K);
+        QMKPressButton *b = [QMKPressButton buttonWithType:UIButtonTypeCustom];
+        b.frame = f;
+        b.tag = extra[i].tag;
+        b.layer.cornerRadius = 14 * K;
+        b.backgroundColor = extra[i].color;
+        b.layer.borderWidth = 1.5;
+        b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+        [b setTitle:extra[i].title forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:10 * K];
+        b.titleLabel.numberOfLines = 2;
+        b.titleLabel.textAlignment = NSTextAlignmentCenter;
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [b addTarget:vc action:extra[i].action forControlEvents:UIControlEventTouchUpInside];
+        [podL addSubview:b];
+        if (b.tag == QMK_TAG_ROT) QMKController().rotBtn = b;
+    }
+
+    // 迷你 RTMP: 开关 + 输入 (镜像到原控件后走原方法)
+    UISwitch *miniSw = [[UISwitch alloc] initWithFrame:CGRectMake(14 * K, 276 * K, 51 * K, 31 * K)];
+    miniSw.tag = VP_TAG_MINISW;
+    miniSw.onTintColor = QMKColorGreen();
+    miniSw.transform = CGAffineTransformMakeScale(K, K);
+    [miniSw addTarget:vc action:@selector(vpMiniSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [podL addSubview:miniSw];
+
+    UITextField *miniTf = [[UITextField alloc] initWithFrame:CGRectMake(72 * K, 280 * K, 84 * K, 22 * K)];
+    miniTf.tag = VP_TAG_MINITF;
+    miniTf.font = [UIFont systemFontOfSize:8 * K];
+    miniTf.textColor = [UIColor colorWithRed:0.81 green:0.88 blue:1 alpha:1];
+    miniTf.backgroundColor = [UIColor colorWithRed:0.24 green:0.48 blue:1 alpha:0.15];
+    miniTf.layer.cornerRadius = 6 * K;
+    miniTf.layer.borderWidth = 1;
+    miniTf.layer.borderColor = QMKColorBlue().CGColor;
+    miniTf.keyboardType = UIKeyboardTypeURL;
+    miniTf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    miniTf.returnKeyType = UIReturnKeyDone;
+    miniTf.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"rtmp://..."
+        attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.35]}];
+    [miniTf addTarget:vc action:@selector(vpMiniTfEnd:) forControlEvents:UIControlEventEditingDidEnd];
+    [miniTf addTarget:vc action:@selector(vpMiniTfEnd:) forControlEvents:UIControlEventEditingDidEndOnExit];
+    [podL addSubview:miniTf];
+
+    // --- 右状态舱 ---
+    UIView *podR = [[UIView alloc] initWithFrame:CGRectMake(W - 12 * K - 124 * K, 88 * K, 124 * K, 330 * K)];
+    podR.layer.cornerRadius = 22 * K;
+    podR.layer.borderWidth = 1.5;
+    podR.layer.borderColor = QMKColorBlue().CGColor;
+    podR.backgroundColor = QMKColorGlass();
+    podR.layer.shadowColor = [UIColor blackColor].CGColor;
+    podR.layer.shadowOpacity = 0.4f;
+    podR.layer.shadowOffset = CGSizeMake(0, 12 * K);
+    podR.layer.shadowRadius = 32 * K;
+    UIVisualEffectView *blurR = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+    blurR.frame = podR.bounds;
+    blurR.layer.cornerRadius = 22 * K;
+    blurR.layer.masksToBounds = YES;
+    [podR addSubview:blurR];
+    [root addSubview:podR];
+
+    UILabel *podTitleR = [[UILabel alloc] initWithFrame:CGRectMake(0, 14 * K, 124 * K, 12 * K)];
+    podTitleR.text = @"状态";
+    podTitleR.font = [UIFont boldSystemFontOfSize:9 * K];
+    podTitleR.textColor = QMKColorBlue();
+    podTitleR.textAlignment = NSTextAlignmentCenter;
+    [podR addSubview:podTitleR];
+
+    UIView *eye = [[UIView alloc] initWithFrame:CGRectMake((124 * K - 68 * K) / 2, 32 * K, 68 * K, 68 * K)];
+    eye.layer.cornerRadius = 34 * K;
+    eye.backgroundColor = QMKColorBlue();
+    eye.layer.borderWidth = 2;
+    eye.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.7].CGColor;
+    eye.layer.shadowColor = QMKColorBlue().CGColor;
+    eye.layer.shadowOpacity = 0.9f;
+    eye.layer.shadowRadius = 16 * K;
+    [podR addSubview:eye];
+    UIImageView *eyeIv = [[UIImageView alloc] initWithFrame:CGRectInset(eye.bounds, 14 * K, 14 * K)];
+    eyeIv.image = QMKEyeIcon([UIColor whiteColor]);
+    eyeIv.contentMode = UIViewContentModeScaleAspectFit;
+    [eye addSubview:eyeIv];
+
+    UILabel *badge = [[UILabel alloc] initWithFrame:CGRectMake((124 * K - 52 * K) / 2, 108 * K, 52 * K, 18 * K)];
+    badge.tag = VP_TAG_BADGE;
+    badge.font = [UIFont boldSystemFontOfSize:10 * K];
+    badge.textColor = [UIColor colorWithWhite:0.06 alpha:1];
+    badge.textAlignment = NSTextAlignmentCenter;
+    badge.layer.cornerRadius = 9 * K;
+    badge.layer.masksToBounds = YES;
+    [podR addSubview:badge];
+
+    UILabel *rtmpLab = [[UILabel alloc] initWithFrame:CGRectMake(0, 134 * K, 124 * K, 10 * K)];
+    rtmpLab.text = @"RTMP";
+    rtmpLab.font = [UIFont systemFontOfSize:8 * K];
+    rtmpLab.textColor = QMKColorGreen();
+    rtmpLab.textAlignment = NSTextAlignmentCenter;
+    [podR addSubview:rtmpLab];
+    UISwitch *rtmpSw = [[UISwitch alloc] initWithFrame:CGRectMake((124 * K - 51 * K) / 2, 148 * K, 51 * K, 31 * K)];
+    rtmpSw.tag = VP_TAG_RTMPSW;
+    rtmpSw.onTintColor = QMKColorBlue();
+    rtmpSw.transform = CGAffineTransformMakeScale(K, K);
+    [rtmpSw addTarget:vc action:@selector(vpRtmpSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [podR addSubview:rtmpSw];
+
+    // 日志诊断键 (弹窗 + 复制日志 + 清空, 不依赖补丁任何逻辑)
+    QMKPressButton *logBtn = [QMKPressButton buttonWithType:UIButtonTypeCustom];
+    logBtn.tag = QMK_TAG_LOG;
+    logBtn.frame = CGRectMake(14 * K, 202 * K, 96 * K, 32 * K);
+    logBtn.layer.cornerRadius = 10 * K;
+    logBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.36 blue:0.36 alpha:1.0];
+    logBtn.layer.borderWidth = 1.5;
+    logBtn.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+    [logBtn setTitle:@"📋 错误日志" forState:UIControlStateNormal];
+    logBtn.titleLabel.font = [UIFont boldSystemFontOfSize:9 * K];
+    [logBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [logBtn addTarget:vc action:@selector(qmkLogTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [podR addSubview:logBtn];
+
+    // --- 底部双键: 教程 / 关闭 ---
+    CGFloat footY = 452 * K;
+    CGFloat footH = 44 * K;
+    CGFloat footW = (W - 24 * K - 12 * K) / 2;
+    QMKPressButton *tut = [QMKPressButton buttonWithType:UIButtonTypeCustom];
+    tut.tag = QMK_TAG_TUT;
+    tut.frame = CGRectMake(12 * K, footY, footW, footH);
+    tut.layer.cornerRadius = 16 * K;
+    tut.backgroundColor = QMKColorBlue();
+    tut.layer.borderWidth = 1.5;
+    tut.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+    [tut setImage:QMKBookIcon([UIColor whiteColor]) forState:UIControlStateNormal];
+    tut.imageEdgeInsets = UIEdgeInsetsMake(11 * K, 11 * K, 11 * K, 11 * K);
+    [tut addTarget:vc action:@selector(openTutorial) forControlEvents:UIControlEventTouchUpInside];
+    [root addSubview:tut];
+
+    QMKPressButton *close = [QMKPressButton buttonWithType:UIButtonTypeCustom];
+    close.tag = QMK_TAG_CLS;
+    close.frame = CGRectMake(12 * K + footW + 12 * K, footY, footW, footH);
+    close.layer.cornerRadius = 16 * K;
+    close.backgroundColor = QMKColorPink();
+    close.layer.borderWidth = 1.5;
+    close.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+    [close setImage:QMKXIcon([UIColor whiteColor]) forState:UIControlStateNormal];
+    close.imageEdgeInsets = UIEdgeInsetsMake(11 * K, 11 * K, 11 * K, 11 * K);
+    [close addTarget:vc action:@selector(dismissPanel) forControlEvents:UIControlEventTouchUpInside];
+    [root addSubview:close];
+
+    // 初始徽章同步 (原逻辑 0.1s 后由 updateStatusLabel 更新)
+    QMKInfo(@"面板已整面重建 (原功能键 + 旋转 + 彩色注入)");
+}
+
+static void qmkLogTapped(id self, SEL _cmd, id sender) {
+    [QMKController() showLogAlert];
+}
+
+// ---------------------------------------------------------------
+// 旧面板实例销毁 (残留根治): 新实例 viewDidLoad 时机同步执行 —
+// 旧实例窗口不回收正是"短暂停留后跳到新面板"的根因; 这里改为:
+// view 整面摘除 + 独立面板窗隐藏 (悬浮球同窗时只摘面板视图)
+// ---------------------------------------------------------------
+static void QMKDestroyOtherPanels(id keep) {
+    @try {
+        NSArray *entries = QMKFindAllPanelEntries();
+        BOOL any = NO;
+        for (NSDictionary *e in entries) {
+            if (![e[@"kind"] isEqualToString:@"vc"]) continue;
+            UIViewController *vc = e[@"vc"];
+            if (!vc || vc == keep) continue;
+            UIWindow *w = e[@"win"];
+            if (!w || w.hidden) continue;
+            UIView *v = e[@"view"];
+            if (!v || v.hidden) continue;
+            @try { if (vc.presentingViewController) [vc dismissViewControllerAnimated:NO completion:nil]; }
+            @catch (NSException *ex) {}
+            [v removeFromSuperview];
+            if (![w viewWithTag:VP_TAG_BALLIMG]) w.hidden = YES;
+            any = YES;
+        }
+        if (any) QMKInfo(@"旧面板实例已销毁 (残留根治)");
+    } @catch (NSException *e) { QMKErr(@"destroy-panels", e); }
+}
+
+// ---------------------------------------------------------------
+// 面板接管: viewDidLoad 挂载 (整面重建 + 旧实例销毁 + 兜底重建)
+// 此段逻辑移植自旧项目「UI源码界面虚浮窗功能 无汉字图标」的
+// 面板重建/生命周期语义, 已适配当前框架 (千面 VCamSettingsViewController
+// + VCamUIPatch 补丁运行时体系, UIKit 插件式)
+// ---------------------------------------------------------------
+static void (*origSettingsViewDidLoad)(id, SEL) = NULL;
+static void QMKSettingsViewDidLoad(id self, SEL _cmd) {
+    @try {
+        if (origSettingsViewDidLoad) origSettingsViewDidLoad(self, _cmd);
+        // 旧实例同步销毁: 新面板创建瞬间, 屏幕上的旧面板立即消失 (无短暂停留)
+        QMKDestroyOtherPanels(self);
+        // 整面重建 (照源码 VPBuildPanel 布局与调用逻辑)
+        QMKBuildPanel(self);
+        // 兜底重建: 覆盖 swizzle 顺序差异 (若补丁 VPBuildPanel 在链内后执行)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try { QMKBuildPanel(self); } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) {
+        QMKErr(@"settings-viewdidload", e);
+        if (origSettingsViewDidLoad) origSettingsViewDidLoad(self, _cmd);
+    }
+}
+
+static BOOL QMKPanelHooked = NO;
+static void QMKInstallPanelHooks(void) {
+    if (QMKPanelHooked) return;
+    @try {
+        Class settings = NSClassFromString(@"VCamSettingsViewController");
+        if (!settings) return;
+        Method m = class_getInstanceMethod(settings, @selector(viewDidLoad));
+        if (!m) return;
+        IMP orig = method_getImplementation(m);
+        if (orig == (IMP)QMKSettingsViewDidLoad) { QMKPanelHooked = YES; return; }
+        origSettingsViewDidLoad = (void (*)(id, SEL))orig;
+        method_setImplementation(m, (IMP)QMKSettingsViewDidLoad);
+        // 附加动作 (幂等; 补丁已加则跳过)
+        class_addMethod(settings, @selector(vpMiniSwitchChanged:), (IMP)qmkMiniSwitchChanged, "v@:@");
+        class_addMethod(settings, @selector(vpMiniTfEnd:), (IMP)qmkMiniTfEnd, "v@:@");
+        class_addMethod(settings, @selector(vpRtmpSwitchChanged:), (IMP)qmkRtmpSwitchChanged, "v@:@");
+        class_addMethod(settings, @selector(qmkRotTapped:), (IMP)qmkRotTapped, "v@:@");
+        class_addMethod(settings, @selector(qmkColorTapped:), (IMP)qmkColorTapped, "v@:@");
+        class_addMethod(settings, @selector(qmkLogTapped:), (IMP)qmkLogTapped, "v@:@");
+        QMKPanelHooked = YES;
+        QMKInfo(@"面板接管: viewDidLoad 已挂载 (整面重建 + 旧实例销毁)");
+    } @catch (NSException *e) { QMKErr(@"panel-install", e); }
+}
+
+static void QMKSchedulePanelInstall(void) {
+    QMKInstallPanelHooks();
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(src, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                              1 * NSEC_PER_SEC, NSEC_PER_SEC);
+    __block int tries = 0;
+    dispatch_source_set_event_handler(src, ^{
+        @autoreleasepool {
+            @try {
+                if (QMKPanelHooked) { dispatch_source_cancel(src); return; }
+                if (++tries >= 60) {
+                    QMKLogLine(@"ERR", nil, @"面板接管 60s 内未装成: 无 VCamSettingsViewController/viewDidLoad");
+                    dispatch_source_cancel(src);
+                    return;
+                }
+                QMKInstallPanelHooks();
+            } @catch (NSException *e) {}
+        }
+    });
+    dispatch_resume(src);
 }
 
 // 收集面板条目 (无界扫描): 标题标签 → responder 链命中 VCamSettingsViewController
@@ -837,30 +1185,14 @@ static void QMKTick(void) {
                 primary = e[@"vc"];
             }
         }
-        // 非主 vc 整面隐藏 + 无 VC 容器兜底隐藏; 仅在有可见主面板时执行
-        // (收起态不动任何根: 应用仅靠窗口隐藏/恢复时面板不能被我们永久藏死)
         if (primaryView) {
-            UIWindow *pw = [primaryView window];
-            for (NSDictionary *e in entries) {
-                UIView *v = e[@"view"];
-                if (!v || v.hidden) continue;
-                BOOL isContainer = [e[@"kind"] isEqualToString:@"container"];
-                if (v != primaryView || isContainer) {
-                    v.hidden = YES;
-                }
-                if (v != primaryView) {
-                    // 双保险: 非主面板若挂在专用面板窗 (非正常层级/非主窗), 整窗一并
-                    // 隐藏 — 防视图层级怪癖导致 vc.view 隐藏后仍有残留 (用户实测旧面板残留)
-                    UIWindow *w = e[@"win"];
-                    if (w && w != pw && w.windowLevel > UIWindowLevelNormal &&
-                        !w.hidden && !w.isKeyWindow) {
-                        w.hidden = YES;
-                    }
-                }
+            // A4 兜底: 主面板根无我方构建标记 -> 重建 (覆盖任何未经 viewDidLoad 的布局异常)
+            if (primaryView.tag != QMK_TAG_OWN) {
+                QMKBuildPanel(primary);
             }
+            // 多实例根治: 其余可见 vc 实例一律销毁 (旧实例窗口不回收 → 残留)
+            QMKDestroyOtherPanels(primary);
             QMKController().panelVC = primary;
-            QMKAttachUnifiedPod(primary);
-            QMKRefreshStatus(primary);
         }
         BOOL visible = (primaryView != nil);
         if (visible != lastVisible) {
@@ -888,8 +1220,9 @@ static void QMKInit(void) {
             if (p == QMKProcessOther) return;
             QMKMarkInjected(p);
             if (p == QMKProcessSpringBoard) {
-                QMKInfo(@"VCamExtraKeys LV-6 UI 层已注入 (SpringBoard)");
+                QMKInfo(@"VCamExtraKeys LV-7 UI 层已注入 (SpringBoard)");
                 QMKMigrateLegacyRotation();
+                QMKSchedulePanelInstall();
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
                         QMKTick();
@@ -897,7 +1230,7 @@ static void QMKInit(void) {
                 });
                 return;
             }
-            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-6 帧层已注入 (%@)", QMKProcName(p)]);
+            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-7 帧层已注入 (%@)", QMKProcName(p)]);
             QMKScheduleFrameInstall();
         } @catch (NSException *e) { QMKErr(@"init", e); }
     }
