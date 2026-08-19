@@ -28,6 +28,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
 #import <string.h>
+#import <stdlib.h>
+#import <math.h>
 #import <objc/runtime.h>
 
 static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
@@ -178,31 +180,86 @@ static id QMKSafeCall(id target, SEL sel, id arg) {
 #pragma clang diagnostic pop
 }
 
-// 像素平面旋转 (CPU 直接拷贝, bpp=每像素字节): 
-// 90°: dst(列tx, 行ty) = src(行 H-1-tx, 列 ty)   [顺时针, 宽高互换]
-// 180°: dst(tx,ty) = src(W-1-tx, H-1-ty)          [行列全反转]
-// 270°: dst(列tx, 行ty) = src(行 ty, 列 W-1-tx)   [逆时针, 宽高互换]
-static void QMKRotatePlane(uint8_t *src, uint8_t *dst,
-                           size_t W, size_t H,
-                           size_t sbpr, size_t dbpr,
-                           size_t bpp, NSInteger rot) {
-    size_t x, y;
+// [黑屏/崩溃深层根因] 旧项目为采集端"就地旋转"(buffer 尺寸不变); 新框架
+// mediaserverd + VCamCore 缓冲池尺寸固定(720x1280), 消费端旋转必须保持输出尺寸
+// = 源尺寸, 否则引擎管线尺寸失配 -> 崩溃/黑屏 (用户实测 90°/270° 输出 1280x720 崩溃).
+// 故: 反向映射(gather)最近邻采样, 内容旋转 + scale=max 放大填充居中裁剪,
+// 严格对齐旧项目参考算法 (CGAffineTransform 连续坐标模型, 见 lv3 T2, 已逐点验证).
+static void QMKRotatePlaneKeep(uint8_t *src, uint8_t *dst,
+                               size_t pw, size_t ph, size_t sbpr, size_t dbpr,
+                               size_t bpp, NSInteger rot) {
+    size_t ew = (rot == 90 || rot == 270) ? ph : pw;
+    size_t eh = (rot == 90 || rot == 270) ? pw : ph;
+    double sw = (double)pw / (double)ew;
+    double sh = (double)ph / (double)eh;
+    double scale = (sw > sh) ? sw : sh;                      // max(w/ew, h/eh)
+    double offx = ((double)pw - (double)ew * scale) / 2.0;
+    double offy = ((double)ph - (double)eh * scale) / 2.0;
+
+    size_t n = pw + ph;
+    long *colTab = (long *)malloc(n * sizeof(long));
+    long *rowTab = (long *)malloc(n * sizeof(long));
+    if (!colTab || !rowTab) { if (colTab) free(colTab); if (rowTab) free(rowTab); return; }
+
+    // 反向映射: 输出像素中心 -> 源连续坐标 -> 最近邻(floor). 行列分离预计算(每帧仅 pw+ph 次浮点).
     if (rot == 90) {
-        for (y = 0; y < H; y++)
-            for (x = 0; x < W; x++)
-                memcpy(dst + x * dbpr + (H - 1 - y) * bpp,
-                       src + y * sbpr + x * bpp, bpp);
+        for (size_t dy = 0; dy < ph; dy++) {
+            double sx = ((double)dy + 0.5 - offy) / scale;
+            long ix = (long)floor(sx);
+            colTab[dy] = (ix < 0) ? 0 : (ix >= (long)pw ? (long)pw - 1 : ix);
+        }
+        for (size_t dx = 0; dx < pw; dx++) {
+            double sy = (double)ph - ((double)dx + 0.5 - offx) / scale;
+            long iy = (long)floor(sy);
+            rowTab[dx] = (iy < 0) ? 0 : (iy >= (long)ph ? (long)ph - 1 : iy);
+        }
     } else if (rot == 180) {
-        for (y = 0; y < H; y++)
-            for (x = 0; x < W; x++)
-                memcpy(dst + (H - 1 - y) * dbpr + (W - 1 - x) * bpp,
-                       src + y * sbpr + x * bpp, bpp);
+        for (size_t dx = 0; dx < pw; dx++) {
+            double sx = (double)pw - ((double)dx + 0.5 - offx) / scale;
+            long ix = (long)floor(sx);
+            colTab[dx] = (ix < 0) ? 0 : (ix >= (long)pw ? (long)pw - 1 : ix);
+        }
+        for (size_t dy = 0; dy < ph; dy++) {
+            double sy = (double)ph - ((double)dy + 0.5 - offy) / scale;
+            long iy = (long)floor(sy);
+            rowTab[dy] = (iy < 0) ? 0 : (iy >= (long)ph ? (long)ph - 1 : iy);
+        }
     } else { // 270
-        for (y = 0; y < H; y++)
-            for (x = 0; x < W; x++)
-                memcpy(dst + (W - 1 - x) * dbpr + y * bpp,
-                       src + y * sbpr + x * bpp, bpp);
+        for (size_t dy = 0; dy < ph; dy++) {
+            double sx = (double)pw - ((double)dy + 0.5 - offy) / scale;
+            long ix = (long)floor(sx);
+            colTab[dy] = (ix < 0) ? 0 : (ix >= (long)pw ? (long)pw - 1 : ix);
+        }
+        for (size_t dx = 0; dx < pw; dx++) {
+            double sy = ((double)dx + 0.5 - offx) / scale;
+            long iy = (long)floor(sy);
+            rowTab[dx] = (iy < 0) ? 0 : (iy >= (long)ph ? (long)ph - 1 : iy);
+        }
     }
+
+    if (bpp == 4) {
+        size_t sw32 = sbpr / 4;
+        uint32_t *s32 = (uint32_t *)src;
+        for (size_t dy = 0; dy < ph; dy++) {
+            uint32_t *drow = (uint32_t *)(dst + dy * dbpr);
+            for (size_t dx = 0; dx < pw; dx++) {
+                size_t sx = (rot == 180) ? (size_t)colTab[dx] : (size_t)colTab[dy];
+                size_t sy = (rot == 180) ? (size_t)rowTab[dy] : (size_t)rowTab[dx];
+                drow[dx] = s32[sy * sw32 + sx];
+            }
+        }
+    } else {
+        for (size_t dy = 0; dy < ph; dy++) {
+            uint8_t *drow = dst + dy * dbpr;
+            for (size_t dx = 0; dx < pw; dx++) {
+                size_t sx = (rot == 180) ? (size_t)colTab[dx] : (size_t)colTab[dy];
+                size_t sy = (rot == 180) ? (size_t)rowTab[dy] : (size_t)rowTab[dx];
+                memcpy(drow + dx * bpp, src + sy * sbpr + sx * bpp, bpp);
+            }
+        }
+    }
+    free(colTab);
+    free(rowTab);
 }
 
 static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, NSInteger rot) {
@@ -215,21 +272,18 @@ static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, N
             CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
             return NULL;
         }
-        // [黑屏修复] 旧项目为采集端 GPU/CPU 就地旋转; 新框架下 mediaserverd 为
-        // 无 UI 守护进程, CoreImage CIContext render 是空操作 -> 旋转帧全零 -> 黑屏.
-        // 已翻译为 CPU 直接像素旋转 (对齐旧项目"像素原位旋转"业务逻辑),
-        // 格式保持 420v/420f/BGRA (核心 YUV 管线兼容)
+        // [黑屏修复] CoreImage CIContext 在 mediaserverd(无 UI 守护进程)中 render 为空操作
+        // -> 旋转帧全零 -> 黑屏; 已翻译为 CPU 直接像素旋转 (对齐旧项目"就地旋转"业务逻辑).
+        // 输出尺寸保持 = 源尺寸 (w×h), 内容旋转 + scale=max 填充裁剪, 格式保持 420v/420f/BGRA.
         OSType fmt = CVPixelBufferGetPixelFormatType(src);
         if (fmt != kCVPixelFormatType_32BGRA &&
             fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
             fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
             fmt = kCVPixelFormatType_32BGRA;
         }
-        size_t w2 = (rot == 90 || rot == 270) ? h : w;
-        size_t h2 = (rot == 90 || rot == 270) ? w : h;
         NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
         CVPixelBufferRef dst = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, w2, h2, fmt,
+        CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h, fmt,
                             (__bridge CFDictionaryRef)attrs, &dst);
         if (!dst) {
             CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
@@ -242,17 +296,17 @@ static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, N
         size_t sbpr = CVPixelBufferGetBytesPerRow(src);
         size_t dbpr = CVPixelBufferGetBytesPerRow(dst);
         if (fmt == kCVPixelFormatType_32BGRA) {
-            QMKRotatePlane(sbase, dbase, w, h, sbpr, dbpr, 4, rot);
+            QMKRotatePlaneKeep(sbase, dbase, w, h, sbpr, dbpr, 4, rot);
         } else {
-            // 420 双平面: Y (1B) + CbCr 交错 (2B, 尺寸减半)
+            // 420 双平面: Y (1B) + CbCr 交错 (2B, 尺寸减半); 各平面独立反向映射(scale 比例一致)
             size_t wU = w / 2, hU = h / 2;
             size_t sUp = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
             size_t dUp = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
             uint8_t *suv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
             uint8_t *duv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
-            QMKRotatePlane(sbase, dbase, w, h, sbpr, dbpr, 1, rot);
+            QMKRotatePlaneKeep(sbase, dbase, w, h, sbpr, dbpr, 1, rot);
             if (suv && duv && wU > 0 && hU > 0)
-                QMKRotatePlane(suv, duv, wU, hU, sUp, dUp, 2, rot);
+                QMKRotatePlaneKeep(suv, duv, wU, hU, sUp, dUp, 2, rot);
         }
         CVPixelBufferUnlockBaseAddress(dst, 0);
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
@@ -352,7 +406,10 @@ static CVBufferRef QMKCopyCurrentFrameHook(id self, SEL _cmd) {
         if (!f) return f;
         NSInteger rot = QMKReadRotation();
         if (rot == 0) return f;
-        CVPixelBufferRef r = QMKRotCached(f, rot);
+        // [所有权修复] copyCurrentFrame 为 "copy" 语义: 调用者获得 +1 并负责 release.
+        // 故独立分配旋转帧(不经共享缓存), 返回 +1 让上层 release 平衡, 避免
+        // 缓存裸指针被上层 release 后悬挂 -> use-after-free -> 崩溃 (用户实测).
+        CVPixelBufferRef r = QMKApplyRotationPreservingFormat(f, rot);
         if (r) {
             int64_t n = __sync_add_and_fetch(&QMKFramesRotated, 1);
             if (n % 60 == 1) {
