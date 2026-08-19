@@ -180,215 +180,75 @@ static id QMKSafeCall(id target, SEL sel, id arg) {
 #pragma clang diagnostic pop
 }
 
-// [黑屏/崩溃深层根因] 旧项目为采集端"就地旋转"(buffer 尺寸不变); 新框架
-// mediaserverd + VCamCore 缓冲池尺寸固定(720x1280), 消费端旋转必须保持输出尺寸
-// = 源尺寸, 否则引擎管线尺寸失配 -> 崩溃/黑屏 (用户实测 90°/270° 输出 1280x720 崩溃).
-// 故: 反向映射(gather)最近邻采样, 内容旋转 + scale=max 放大填充居中裁剪,
-// 严格对齐旧项目参考算法 (CGAffineTransform 连续坐标模型, 见 lv3 T2, 已逐点验证).
-static void QMKRotatePlaneKeep(uint8_t *src, uint8_t *dst,
-                               size_t pw, size_t ph, size_t sbpr, size_t dbpr,
-                               size_t bpp, NSInteger rot) {
-    size_t ew = (rot == 90 || rot == 270) ? ph : pw;
-    size_t eh = (rot == 90 || rot == 270) ? pw : ph;
-    double sw = (double)pw / (double)ew;
-    double sh = (double)ph / (double)eh;
-    double scale = (sw > sh) ? sw : sh;                      // max(w/ew, h/eh)
-    double offx = ((double)pw - (double)ew * scale) / 2.0;
-    double offy = ((double)ph - (double)eh * scale) / 2.0;
-
-    size_t n = pw + ph;
-    long *colTab = (long *)malloc(n * sizeof(long));
-    long *rowTab = (long *)malloc(n * sizeof(long));
-    if (!colTab || !rowTab) { if (colTab) free(colTab); if (rowTab) free(rowTab); return; }
-
-    // 反向映射: 输出像素中心 -> 源连续坐标 -> 最近邻(floor). 行列分离预计算(每帧仅 pw+ph 次浮点).
-    if (rot == 90) {
-        for (size_t dy = 0; dy < ph; dy++) {
-            double sx = ((double)dy + 0.5 - offy) / scale;
-            long ix = (long)floor(sx);
-            colTab[dy] = (ix < 0) ? 0 : (ix >= (long)pw ? (long)pw - 1 : ix);
-        }
-        for (size_t dx = 0; dx < pw; dx++) {
-            double sy = (double)ph - ((double)dx + 0.5 - offx) / scale;
-            long iy = (long)floor(sy);
-            rowTab[dx] = (iy < 0) ? 0 : (iy >= (long)ph ? (long)ph - 1 : iy);
-        }
-    } else if (rot == 180) {
-        for (size_t dx = 0; dx < pw; dx++) {
-            double sx = (double)pw - ((double)dx + 0.5 - offx) / scale;
-            long ix = (long)floor(sx);
-            colTab[dx] = (ix < 0) ? 0 : (ix >= (long)pw ? (long)pw - 1 : ix);
-        }
-        for (size_t dy = 0; dy < ph; dy++) {
-            double sy = (double)ph - ((double)dy + 0.5 - offy) / scale;
-            long iy = (long)floor(sy);
-            rowTab[dy] = (iy < 0) ? 0 : (iy >= (long)ph ? (long)ph - 1 : iy);
-        }
-    } else { // 270
-        for (size_t dy = 0; dy < ph; dy++) {
-            double sx = (double)pw - ((double)dy + 0.5 - offy) / scale;
-            long ix = (long)floor(sx);
-            colTab[dy] = (ix < 0) ? 0 : (ix >= (long)pw ? (long)pw - 1 : ix);
-        }
-        for (size_t dx = 0; dx < pw; dx++) {
-            double sy = ((double)dx + 0.5 - offx) / scale;
-            long iy = (long)floor(sy);
-            rowTab[dx] = (iy < 0) ? 0 : (iy >= (long)ph ? (long)ph - 1 : iy);
-        }
-    }
-
-    if (bpp == 4) {
-        size_t sw32 = sbpr / 4;
-        uint32_t *s32 = (uint32_t *)src;
-        for (size_t dy = 0; dy < ph; dy++) {
-            uint32_t *drow = (uint32_t *)(dst + dy * dbpr);
-            for (size_t dx = 0; dx < pw; dx++) {
-                size_t sx = (rot == 180) ? (size_t)colTab[dx] : (size_t)colTab[dy];
-                size_t sy = (rot == 180) ? (size_t)rowTab[dy] : (size_t)rowTab[dx];
-                drow[dx] = s32[sy * sw32 + sx];
-            }
-        }
-    } else {
-        for (size_t dy = 0; dy < ph; dy++) {
-            uint8_t *drow = dst + dy * dbpr;
-            for (size_t dx = 0; dx < pw; dx++) {
-                size_t sx = (rot == 180) ? (size_t)colTab[dx] : (size_t)colTab[dy];
-                size_t sy = (rot == 180) ? (size_t)rowTab[dy] : (size_t)rowTab[dx];
-                memcpy(drow + dx * bpp, src + sy * sbpr + sx * bpp, bpp);
-            }
-        }
-    }
-    free(colTab);
-    free(rowTab);
-}
-
-static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, NSInteger rot) {
-    if (!src || rot == 0) return NULL;
+// [方向探测] 用户确认: 旧项目"旋转"= 旋转视频方向(orientation/transform 元数据),
+// 视频与像素均不变 (非像素旋转). 前几版像素旋转是错误方向 -> 卡顿/发热/崩溃.
+// 新项目闭源, 方向 API 需探测定位: 枚举 LocalVideoPlayer 方法/实例变量 + buffer 附件.
+static void QMKProbeDirection(id self, CVBufferRef buf) {
     @try {
-        CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        size_t w = CVPixelBufferGetWidth(src);
-        size_t h = CVPixelBufferGetHeight(src);
-        if (w == 0 || h == 0) {
-            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-            return NULL;
-        }
-        // [黑屏修复] CoreImage CIContext 在 mediaserverd(无 UI 守护进程)中 render 为空操作
-        // -> 旋转帧全零 -> 黑屏; 已翻译为 CPU 直接像素旋转 (对齐旧项目"就地旋转"业务逻辑).
-        // 输出尺寸保持 = 源尺寸 (w×h), 内容旋转 + scale=max 填充裁剪, 格式保持 420v/420f/BGRA.
-        OSType fmt = CVPixelBufferGetPixelFormatType(src);
-        if (fmt != kCVPixelFormatType_32BGRA &&
-            fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
-            fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
-            fmt = kCVPixelFormatType_32BGRA;
-        }
-        NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-        CVPixelBufferRef dst = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h, fmt,
-                            (__bridge CFDictionaryRef)attrs, &dst);
-        if (!dst) {
-            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-            QMKErr(@"rotation-alloc", nil);
-            return NULL;
-        }
-        CVPixelBufferLockBaseAddress(dst, 0);
-        uint8_t *sbase = (uint8_t *)CVPixelBufferGetBaseAddress(src);
-        uint8_t *dbase = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
-        size_t sbpr = CVPixelBufferGetBytesPerRow(src);
-        size_t dbpr = CVPixelBufferGetBytesPerRow(dst);
-        if (fmt == kCVPixelFormatType_32BGRA) {
-            QMKRotatePlaneKeep(sbase, dbase, w, h, sbpr, dbpr, 4, rot);
-        } else {
-            // 420 双平面: Y (1B) + CbCr 交错 (2B, 尺寸减半); 各平面独立反向映射(scale 比例一致)
-            size_t wU = w / 2, hU = h / 2;
-            size_t sUp = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
-            size_t dUp = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
-            uint8_t *suv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
-            uint8_t *duv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
-            QMKRotatePlaneKeep(sbase, dbase, w, h, sbpr, dbpr, 1, rot);
-            if (suv && duv && wU > 0 && hU > 0)
-                QMKRotatePlaneKeep(suv, duv, wU, hU, sUp, dUp, 2, rot);
-        }
-        CVPixelBufferUnlockBaseAddress(dst, 0);
-        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        return dst;
-    } @catch (NSException *e) {
-        QMKErr(@"rotation-apply", e);
-        return NULL;
-    }
-}
-
-// 旋转帧缓存: 按源 buffer 指针缓存旋转结果, 多入口共享
-// (updateCurrentBuffer:/copyCurrentFrame:/getCurrentFrame:), 防重复旋转/重复分配
-// [黑屏修复] 引擎异步渲染可能滞后数帧, 淘汰即释放会让引擎持有野指针 -> 黑屏;
-// 故: 上限 16 + 淘汰仅摘引用, 延迟 2s 释放 (引擎必已换帧, 既防野指针又防泄漏)
-static NSMutableDictionary *gRotCache = nil;
-static NSMutableArray *gRotCacheKeys = nil;
-static CVPixelBufferRef QMKRotCached(CVBufferRef src, NSInteger rot) {
-    if (!src || rot == 0) return NULL;
-    @synchronized (gRotCache ?: (gRotCache = [NSMutableDictionary dictionary])) {
-        if (!gRotCacheKeys) gRotCacheKeys = [NSMutableArray array];
-        NSValue *key = [NSValue valueWithPointer:src];
-        NSValue *hit = gRotCache[key];
-        if (hit) return (CVPixelBufferRef)[hit pointerValue];
-        while (gRotCacheKeys.count >= 16) {
-            NSValue *old = gRotCacheKeys.firstObject;
-            [gRotCacheKeys removeObjectAtIndex:0];
-            NSValue *v = gRotCache[old];
-            if (v) {
-                [gRotCache removeObjectForKey:old];
-                CVPixelBufferRef doomed = (CVPixelBufferRef)[v pointerValue];
-                CFRetain(doomed);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                    CVPixelBufferRelease(doomed);
-                });
+        Class cls = object_getClass(self);
+        unsigned int mc = 0;
+        Method *methods = class_copyMethodList(cls, &mc);
+        for (unsigned int i = 0; i < mc; i++) {
+            NSString *n = NSStringFromSelector(method_getName(methods[i]));
+            NSString *lower = [n lowercaseString];
+            if ([lower rangeOfString:@"rot"].location != NSNotFound ||
+                [lower rangeOfString:@"orient"].location != NSNotFound ||
+                [lower rangeOfString:@"transform"].location != NSNotFound ||
+                [lower rangeOfString:@"gravity"].location != NSNotFound ||
+                [lower rangeOfString:@"aspect"].location != NSNotFound ||
+                [lower rangeOfString:@"direction"].location != NSNotFound ||
+                [lower rangeOfString:@"angle"].location != NSNotFound) {
+                QMKInfo([NSString stringWithFormat:@"[方向探测] 方法 %@", n]);
             }
         }
-        CVPixelBufferRef out = QMKApplyRotationPreservingFormat(src, rot);
-        if (out) {
-            gRotCache[key] = [NSValue valueWithPointer:out];
-            [gRotCacheKeys addObject:key];
+        if (methods) free(methods);
+        unsigned int ic = 0;
+        Ivar *ivars = class_copyIvarList(cls, &ic);
+        for (unsigned int i = 0; i < ic; i++) {
+            NSString *n = [NSString stringWithUTF8String:ivar_getName(ivars[i])];
+            NSString *lower = [n lowercaseString];
+            if ([lower rangeOfString:@"rot"].location != NSNotFound ||
+                [lower rangeOfString:@"orient"].location != NSNotFound ||
+                [lower rangeOfString:@"transform"].location != NSNotFound ||
+                [lower rangeOfString:@"gravity"].location != NSNotFound ||
+                [lower rangeOfString:@"aspect"].location != NSNotFound ||
+                [lower rangeOfString:@"direction"].location != NSNotFound ||
+                [lower rangeOfString:@"angle"].location != NSNotFound) {
+                QMKInfo([NSString stringWithFormat:@"[方向探测] 实例变量 %@", n]);
+            }
         }
-        return out;
-    }
+        if (ivars) free(ivars);
+        CFDictionaryRef att = CVBufferGetAttachments(buf, kCVAttachmentMode_ShouldPropagate);
+        if (att) {
+            NSDictionary *d = (__bridge NSDictionary *)att;
+            for (id k in [d allKeys]) {
+                QMKInfo([NSString stringWithFormat:@"[方向探测] buffer附件 %@ = %@", k, d[k]]);
+            }
+        }
+    } @catch (NSException *e) { QMKErr(@"probe", e); }
 }
 
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static CVBufferRef (*origCopyCurrentFrame)(id, SEL) = NULL;
 static CVBufferRef (*origGetCurrentFrame)(id, SEL) = NULL;
-static volatile int64_t QMKFramesSeen = 0;
-static volatile int64_t QMKFramesRotated = 0;
+static volatile int64_t QMKFramesSeen = 0;      // update 首帧计数 (帧钩子是否流入)
+static volatile int64_t QMKFramesUpdate = 0;    // updateCurrentBuffer 调用次数
+static volatile int64_t QMKFramesCopy = 0;      // copyCurrentFrame 调用次数
+static volatile int64_t QMKFramesGet = 0;       // getCurrentFrame 调用次数
 static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
-        int64_t n = __sync_add_and_fetch(&QMKFramesSeen, 1);
-        if (n == 1) {
+        __sync_add_and_fetch(&QMKFramesUpdate, 1);
+        int64_t seen = __sync_add_and_fetch(&QMKFramesSeen, 1);
+        if (seen == 1) {
             QMKInfo([NSString stringWithFormat:@"首帧已进入帧钩子 (%zu x %zu, 格式 %c%c%c%c)",
                      CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
                      (char)((CVPixelBufferGetPixelFormatType(buffer) >> 24) & 0xFF),
                      (char)((CVPixelBufferGetPixelFormatType(buffer) >> 16) & 0xFF),
                      (char)((CVPixelBufferGetPixelFormatType(buffer) >> 8) & 0xFF),
                      (char)(CVPixelBufferGetPixelFormatType(buffer) & 0xFF)]);
+            QMKProbeDirection(self, buffer);
         }
-        static NSInteger cachedRot = -1;
-        static double lastRead = 0;
-        double now = [NSDate timeIntervalSinceReferenceDate];
-        if (cachedRot < 0 || (now - lastRead) > 0.5) {
-            cachedRot = QMKReadRotation();
-            lastRead = now;
-        }
-        if (cachedRot != 0 && buffer) {
-            // 共享缓存: 与取帧入口共用同一旋转结果, 不重复分配
-            CVPixelBufferRef rotated = QMKRotCached(buffer, cachedRot);
-            if (rotated) {
-                if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, rotated);
-                int64_t r = __sync_add_and_fetch(&QMKFramesRotated, 1);
-                if (r % 60 == 1) {
-                    QMKInfo([NSString stringWithFormat:@"已旋转 %lld 帧 (%ld° 管线正常)", r, (long)cachedRot]);
-                }
-                return;
-            }
-            QMKWarn(@"旋转应用失败, 回退原始帧");
-        }
+        // 透传 (不再像素旋转: 旋转应改"方向"元数据, 待探测定位 API 后设置)
         if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, buffer);
     } @catch (NSException *e) {
         QMKErr(@"frame-hook", e);
@@ -398,25 +258,14 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
 
 static BOOL QMKFrameInstalled = NO;
 
-// 消费点钩子: copyCurrentFrame / getCurrentFrame — 核心引擎取帧入口,
-// 返回共享缓存旋转帧 (对齐旧项目"消费端旋转"语义)
+// 消费点钩子: copyCurrentFrame / getCurrentFrame — 引擎取帧入口.
+// 旋转已由 update 就地完成, 此处仅透传 + 计数日志 (用于定位引擎真实渲染路径).
 static CVBufferRef QMKCopyCurrentFrameHook(id self, SEL _cmd) {
     @try {
         CVBufferRef f = origCopyCurrentFrame ? origCopyCurrentFrame(self, _cmd) : NULL;
-        if (!f) return f;
-        NSInteger rot = QMKReadRotation();
-        if (rot == 0) return f;
-        // [所有权修复] copyCurrentFrame 为 "copy" 语义: 调用者获得 +1 并负责 release.
-        // 故独立分配旋转帧(不经共享缓存), 返回 +1 让上层 release 平衡, 避免
-        // 缓存裸指针被上层 release 后悬挂 -> use-after-free -> 崩溃 (用户实测).
-        CVPixelBufferRef r = QMKApplyRotationPreservingFormat(f, rot);
-        if (r) {
-            int64_t n = __sync_add_and_fetch(&QMKFramesRotated, 1);
-            if (n % 60 == 1) {
-                QMKInfo([NSString stringWithFormat:@"消费点 copyCurrentFrame 已旋转 %lld 帧 (%ld°)",
-                         n, (long)rot]);
-            }
-            return r;
+        int64_t n = __sync_add_and_fetch(&QMKFramesCopy, 1);
+        if (n % 60 == 1) {
+            QMKInfo([NSString stringWithFormat:@"copy 透传 %lld 帧 (读取引擎当前帧)", n]);
         }
         return f;
     } @catch (NSException *e) {
@@ -429,11 +278,10 @@ static CVBufferRef QMKCopyCurrentFrameHook(id self, SEL _cmd) {
 static CVBufferRef QMKGetCurrentFrameHook(id self, SEL _cmd) {
     @try {
         CVBufferRef f = origGetCurrentFrame ? origGetCurrentFrame(self, _cmd) : NULL;
-        if (!f) return f;
-        NSInteger rot = QMKReadRotation();
-        if (rot == 0) return f;
-        CVPixelBufferRef r = QMKRotCached(f, rot);
-        if (r) return r;
+        int64_t n = __sync_add_and_fetch(&QMKFramesGet, 1);
+        if (n % 60 == 1) {
+            QMKInfo([NSString stringWithFormat:@"get 透传 %lld 帧 (读取引擎当前帧)", n]);
+        }
         return f;
     } @catch (NSException *e) {
         QMKErr(@"get-frame", e);
