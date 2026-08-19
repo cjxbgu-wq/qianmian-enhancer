@@ -1,19 +1,18 @@
-// VCamExtraKeys v7 (LV-5) - 统一功能舱 v3 (vcam 核心/UI补丁/增强模块 零改动)
-// 修复 v6 旧面板仍可见: 根因 = "有界深度扫描"与"每次展示新建实例且不回收"不匹配:
-//   补丁每次 viewDidLoad 全量重建, 旧实例窗口不回收; v6 扫描带深度上限(6层),
-//   旧面板被模态/多级容器埋在更深层级时永远找不到 → 既不隐藏也不绑定。
-//   A1) 无界扫描(迭代栈, 无深度上限)收集面板条目: 标题标签 → responder 链(≤6跳)
-//       命中 VCamSettingsViewController → vc 条目; 未命中 → 容器兜底条目
-//   A2) 主面板 = 可见 vc 条目中 (windowLevel 最高, 其次最新); 容器条目永不为
-//       主面板, 一律兜底隐藏 (陈旧残留)
-//   A3) 非主 vc 面板整面隐藏; 仅在有可见主面板时执行 (收起态不动任何根)
-//   A4) 键转发固定指向主面板活 VC; 面板实例数变化时记录日志
-// B) 视频旋转: 帧层(mediaserverd/lskdd)钩 LocalVideoPlayer updateCurrentBuffer:
-//    照抄参考算法(旋转变换->自适应裁满->渲染回 w x h), 自证诊断:
-//    首帧记尺寸/每60帧报数/10s看门狗(旋转开但无帧流入->ERR)/90s重试
+// VCamExtraKeys v8 (LV-6) - 统一功能舱 v3 (vcam 核心/UI补丁/增强模块 零改动)
+// 面板层 (继承 v7):
+//   A1) 无界扫描(迭代栈)收集面板条目: 标题标签 → responder 链(≤6跳)命中
+//       VCamSettingsViewController → vc 条目; 未命中 → 容器兜底条目
+//   A2) 主面板 = 可见 vc 条目中 (windowLevel 最高, 其次最新); 容器条目永不为主
+//   A3) 非主 vc 面板整面隐藏 + 其专用面板窗(level>normal 且非主窗)整窗隐藏 — 双保险
+//   A4) 键转发仅放行 VCamSettingsViewController 类实例 + @try 保护 (防崩溃黑屏)
+// 旋转层 (对齐旧项目 UI源码界面虚浮窗功能):
+//   B1) 旋转结果保持源格式 (420v/420f/BGRA), 不再固定输出 BGRA — 核心 YUV 管线兼容
+//   B2) 消费点全覆盖: 除 updateCurrentBuffer: 外再钩 copyCurrentFrame/getCurrentFrame
+//       (核心引擎取帧入口), 按源指针共享旋转缓存(≤4)防重复旋转/重复分配
+//   B3) 首帧日志含格式; 每60帧报数; 10s看门狗; 90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
-// D) 输出 LV-5.deb
+// D) 输出 LV-6.deb
 #import <UIKit/UIKit.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
@@ -176,16 +175,25 @@ static CIContext *QMKCI(void) {
     return ctx;
 }
 
-static CVPixelBufferRef QMKApplyRotation(CVPixelBufferRef src, NSInteger rot) {
+static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, NSInteger rot) {
     if (!src || rot == 0) return NULL;
     @try {
         CIImage *img = [CIImage imageWithCVImageBuffer:src];
         size_t w = CVPixelBufferGetWidth(src);
         size_t h = CVPixelBufferGetHeight(src);
         if (w == 0 || h == 0) return NULL;
+        // [对齐旧项目] 旋转结果保持源格式: 核心 YUV 管线要求 420v/420f 输入,
+        // 固定输出 BGRA 会被下游转换丢弃 -> 无效果/黑屏 (用户实测)
+        OSType fmt = CVPixelBufferGetPixelFormatType(src);
+        if (fmt != kCVPixelFormatType_32BGRA &&
+            fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+            fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+            fmt = kCVPixelFormatType_32BGRA;
+        }
+        NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
         CVPixelBufferRef dst = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h,
-                            kCVPixelFormatType_32BGRA, NULL, &dst);
+        CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h, fmt,
+                            (__bridge CFDictionaryRef)attrs, &dst);
         if (!dst) { QMKErr(@"rotation-alloc", nil); return NULL; }
         if (rot == 90)  img = [img imageByApplyingTransform:CGAffineTransformMake(0, 1, -1, 0, h, 0)];
         if (rot == 180) img = [img imageByApplyingTransform:CGAffineTransformMake(-1, 0, 0, -1, w, h)];
@@ -208,15 +216,50 @@ static CVPixelBufferRef QMKApplyRotation(CVPixelBufferRef src, NSInteger rot) {
     }
 }
 
+// 旋转帧缓存: 按源 buffer 指针缓存旋转结果, 多入口共享
+// (updateCurrentBuffer:/copyCurrentFrame:/getCurrentFrame:), 防重复旋转/重复分配
+static NSMutableDictionary *gRotCache = nil;
+static NSMutableArray *gRotCacheKeys = nil;
+static CVPixelBufferRef QMKRotCached(CVBufferRef src, NSInteger rot) {
+    if (!src || rot == 0) return NULL;
+    @synchronized (gRotCache ?: (gRotCache = [NSMutableDictionary dictionary])) {
+        if (!gRotCacheKeys) gRotCacheKeys = [NSMutableArray array];
+        NSValue *key = [NSValue valueWithPointer:src];
+        NSValue *hit = gRotCache[key];
+        if (hit) return (CVPixelBufferRef)[hit pointerValue];
+        while (gRotCacheKeys.count >= 4) {
+            NSValue *old = gRotCacheKeys.firstObject;
+            [gRotCacheKeys removeObjectAtIndex:0];
+            NSValue *v = gRotCache[old];
+            if (v) {
+                CVPixelBufferRelease((CVPixelBufferRef)[v pointerValue]);
+                [gRotCache removeObjectForKey:old];
+            }
+        }
+        CVPixelBufferRef out = QMKApplyRotationPreservingFormat(src, rot);
+        if (out) {
+            gRotCache[key] = [NSValue valueWithPointer:out];
+            [gRotCacheKeys addObject:key];
+        }
+        return out;
+    }
+}
+
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
+static CVBufferRef (*origCopyCurrentFrame)(id, SEL) = NULL;
+static CVBufferRef (*origGetCurrentFrame)(id, SEL) = NULL;
 static volatile int64_t QMKFramesSeen = 0;
 static volatile int64_t QMKFramesRotated = 0;
 static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
         int64_t n = __sync_add_and_fetch(&QMKFramesSeen, 1);
         if (n == 1) {
-            QMKInfo([NSString stringWithFormat:@"首帧已进入帧钩子 (%zu x %zu)",
-                     CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer)]);
+            QMKInfo([NSString stringWithFormat:@"首帧已进入帧钩子 (%zu x %zu, 格式 %c%c%c%c)",
+                     CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
+                     (char)((CVPixelBufferGetPixelFormatType(buffer) >> 24) & 0xFF),
+                     (char)((CVPixelBufferGetPixelFormatType(buffer) >> 16) & 0xFF),
+                     (char)((CVPixelBufferGetPixelFormatType(buffer) >> 8) & 0xFF),
+                     (char)(CVPixelBufferGetPixelFormatType(buffer) & 0xFF)]);
         }
         static NSInteger cachedRot = -1;
         static double lastRead = 0;
@@ -226,10 +269,10 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
             lastRead = now;
         }
         if (cachedRot != 0 && buffer) {
-            CVPixelBufferRef rotated = QMKApplyRotation(buffer, cachedRot);
+            // 共享缓存: 与取帧入口共用同一旋转结果, 不重复分配
+            CVPixelBufferRef rotated = QMKRotCached(buffer, cachedRot);
             if (rotated) {
                 if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, rotated);
-                CVPixelBufferRelease(rotated);
                 int64_t r = __sync_add_and_fetch(&QMKFramesRotated, 1);
                 if (r % 60 == 1) {
                     QMKInfo([NSString stringWithFormat:@"已旋转 %lld 帧 (%ld° 管线正常)", r, (long)cachedRot]);
@@ -246,6 +289,48 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
 }
 
 static BOOL QMKFrameInstalled = NO;
+
+// 消费点钩子: copyCurrentFrame / getCurrentFrame — 核心引擎取帧入口,
+// 返回共享缓存旋转帧 (对齐旧项目"消费端旋转"语义)
+static CVBufferRef QMKCopyCurrentFrameHook(id self, SEL _cmd) {
+    @try {
+        CVBufferRef f = origCopyCurrentFrame ? origCopyCurrentFrame(self, _cmd) : NULL;
+        if (!f) return f;
+        NSInteger rot = QMKReadRotation();
+        if (rot == 0) return f;
+        CVPixelBufferRef r = QMKRotCached(f, rot);
+        if (r) {
+            int64_t n = __sync_add_and_fetch(&QMKFramesRotated, 1);
+            if (n % 60 == 1) {
+                QMKInfo([NSString stringWithFormat:@"消费点 copyCurrentFrame 已旋转 %lld 帧 (%ld°)",
+                         n, (long)rot]);
+            }
+            return r;
+        }
+        return f;
+    } @catch (NSException *e) {
+        QMKErr(@"copy-frame", e);
+        if (origCopyCurrentFrame) return origCopyCurrentFrame(self, _cmd);
+        return NULL;
+    }
+}
+
+static CVBufferRef QMKGetCurrentFrameHook(id self, SEL _cmd) {
+    @try {
+        CVBufferRef f = origGetCurrentFrame ? origGetCurrentFrame(self, _cmd) : NULL;
+        if (!f) return f;
+        NSInteger rot = QMKReadRotation();
+        if (rot == 0) return f;
+        CVPixelBufferRef r = QMKRotCached(f, rot);
+        if (r) return r;
+        return f;
+    } @catch (NSException *e) {
+        QMKErr(@"get-frame", e);
+        if (origGetCurrentFrame) return origGetCurrentFrame(self, _cmd);
+        return NULL;
+    }
+}
+
 static void QMKInstallFrameHook(void) {
     if (QMKFrameInstalled) return;
     @try {
@@ -269,6 +354,27 @@ static void QMKInstallFrameHook(void) {
         if (orig == (IMP)QMKUpdateCurrentBufferHook) { QMKFrameInstalled = YES; return; }
         origUpdateCurrentBuffer = (void (*)(id, SEL, CVBufferRef))orig;
         method_setImplementation(m, (IMP)QMKUpdateCurrentBufferHook);
+        // 核心消费点: 引擎取帧入口 (copyCurrentFrame/getCurrentFrame) 一并钩住,
+        // 返回共享缓存中的旋转帧 — 对齐旧项目"消费端旋转", 防取帧路径绕过存储钩子
+        Class lvp2 = NSClassFromString(@"LocalVideoPlayer");
+        if (lvp2) {
+            Method mC = class_getInstanceMethod(lvp2, @selector(copyCurrentFrame));
+            if (mC) {
+                IMP oc = method_getImplementation(mC);
+                if (oc != (IMP)QMKCopyCurrentFrameHook) {
+                    origCopyCurrentFrame = (CVBufferRef (*)(id, SEL))oc;
+                    method_setImplementation(mC, (IMP)QMKCopyCurrentFrameHook);
+                }
+            }
+            Method mG = class_getInstanceMethod(lvp2, @selector(getCurrentFrame));
+            if (mG) {
+                IMP og = method_getImplementation(mG);
+                if (og != (IMP)QMKGetCurrentFrameHook) {
+                    origGetCurrentFrame = (CVBufferRef (*)(id, SEL))og;
+                    method_setImplementation(mG, (IMP)QMKGetCurrentFrameHook);
+                }
+            }
+        }
         QMKFrameInstalled = YES;
         QMKInfo([NSString stringWithFormat:@"帧钩子已安装 (%@, %lld 帧待处理)",
                  QMKProcName(QMKProc()), QMKFramesSeen]);
@@ -373,13 +479,26 @@ static void QMKUrlCommit(UIViewController *vc);
 
 - (void)forwardSel:(SEL)sel {
     UIViewController *vc = self.panelVC;
-    if (!vc || ![vc respondsToSelector:sel]) {
+    Class cls = NSClassFromString(@"VCamSettingsViewController");
+    // 类校验 + 可见性校验: 只转发给可见的活面板 (防陈旧/已收起实例触发核心动作导致崩溃黑屏)
+    if (!vc || (cls && ![vc isKindOfClass:cls]) || ![vc respondsToSelector:sel]) {
         QMKWarn([NSString stringWithFormat:@"面板 VC 不可用或方法缺失: %@",
                  NSStringFromSelector(sel)]);
         return;
     }
-    QMKSafeCall(vc, sel, nil);
-    QMKInfo([NSString stringWithFormat:@"已触发原功能: %@", NSStringFromSelector(sel)]);
+    UIView *rv = vc.view;
+    if (!rv || rv.hidden || !rv.window) {
+        QMKWarn([NSString stringWithFormat:@"面板 VC 不可见, 拒绝转发: %@",
+                 NSStringFromSelector(sel)]);
+        return;
+    }
+    @try {
+        QMKSafeCall(vc, sel, nil);
+        QMKInfo([NSString stringWithFormat:@"已触发原功能: %@", NSStringFromSelector(sel)]);
+    } @catch (NSException *e) {
+        QMKErr(@"forward", e);
+        QMKWarn([NSString stringWithFormat:@"原功能触发异常: %@", NSStringFromSelector(sel)]);
+    }
 }
 
 - (void)toggleRtmp {
@@ -721,11 +840,22 @@ static void QMKTick(void) {
         // 非主 vc 整面隐藏 + 无 VC 容器兜底隐藏; 仅在有可见主面板时执行
         // (收起态不动任何根: 应用仅靠窗口隐藏/恢复时面板不能被我们永久藏死)
         if (primaryView) {
+            UIWindow *pw = [primaryView window];
             for (NSDictionary *e in entries) {
                 UIView *v = e[@"view"];
-                if (v && !v.hidden &&
-                    (v != primaryView || [e[@"kind"] isEqualToString:@"container"])) {
+                if (!v || v.hidden) continue;
+                BOOL isContainer = [e[@"kind"] isEqualToString:@"container"];
+                if (v != primaryView || isContainer) {
                     v.hidden = YES;
+                }
+                if (v != primaryView) {
+                    // 双保险: 非主面板若挂在专用面板窗 (非正常层级/非主窗), 整窗一并
+                    // 隐藏 — 防视图层级怪癖导致 vc.view 隐藏后仍有残留 (用户实测旧面板残留)
+                    UIWindow *w = e[@"win"];
+                    if (w && w != pw && w.windowLevel > UIWindowLevelNormal &&
+                        !w.hidden && !w.isKeyWindow) {
+                        w.hidden = YES;
+                    }
                 }
             }
             QMKController().panelVC = primary;
@@ -758,7 +888,7 @@ static void QMKInit(void) {
             if (p == QMKProcessOther) return;
             QMKMarkInjected(p);
             if (p == QMKProcessSpringBoard) {
-                QMKInfo(@"VCamExtraKeys LV-5 UI 层已注入 (SpringBoard)");
+                QMKInfo(@"VCamExtraKeys LV-6 UI 层已注入 (SpringBoard)");
                 QMKMigrateLegacyRotation();
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
@@ -767,7 +897,7 @@ static void QMKInit(void) {
                 });
                 return;
             }
-            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-5 帧层已注入 (%@)", QMKProcName(p)]);
+            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-6 帧层已注入 (%@)", QMKProcName(p)]);
             QMKScheduleFrameInstall();
         } @catch (NSException *e) { QMKErr(@"init", e); }
     }
