@@ -1,16 +1,19 @@
-// VCamExtraKeys v6 (LV-4) - 统一功能舱 v2 (vcam 核心/UI补丁/增强模块 零改动)
-// 修复 v5 双面板/键失效: 补丁面板每次展示新建实例, 旧实例窗口仍可见 →
-//   A1) 枚举所有面板实例, 取最上层可见实例为主面板, 其余整面隐藏 (重复面板彻底消除)
-//   A2) 主面板全量隐藏原控件(标题/双舱/教程/关闭), 仅保留我方统一舱
-//   A3) 键转发固定指向主面板活 VC (不再可能命中陈旧实例)
-//   A4) 10 键 5x2 全功能: 媒体/替换/恢复相机/悬浮球/旋转/增强/日志/RTMP/教程/关闭
-//       (与补丁源码功能一一对应: 4 原方法 + openTutorial + dismissPanel + miniSw/miniTf/badge)
+// VCamExtraKeys v7 (LV-5) - 统一功能舱 v3 (vcam 核心/UI补丁/增强模块 零改动)
+// 修复 v6 旧面板仍可见: 根因 = "有界深度扫描"与"每次展示新建实例且不回收"不匹配:
+//   补丁每次 viewDidLoad 全量重建, 旧实例窗口不回收; v6 扫描带深度上限(6层),
+//   旧面板被模态/多级容器埋在更深层级时永远找不到 → 既不隐藏也不绑定。
+//   A1) 无界扫描(迭代栈, 无深度上限)收集面板条目: 标题标签 → responder 链(≤6跳)
+//       命中 VCamSettingsViewController → vc 条目; 未命中 → 容器兜底条目
+//   A2) 主面板 = 可见 vc 条目中 (windowLevel 最高, 其次最新); 容器条目永不为
+//       主面板, 一律兜底隐藏 (陈旧残留)
+//   A3) 非主 vc 面板整面隐藏; 仅在有可见主面板时执行 (收起态不动任何根)
+//   A4) 键转发固定指向主面板活 VC; 面板实例数变化时记录日志
 // B) 视频旋转: 帧层(mediaserverd/lskdd)钩 LocalVideoPlayer updateCurrentBuffer:
 //    照抄参考算法(旋转变换->自适应裁满->渲染回 w x h), 自证诊断:
 //    首帧记尺寸/每60帧报数/10s看门狗(旋转开但无帧流入->ERR)/90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
-// D) 输出 LV-4.deb
+// D) 输出 LV-5.deb
 #import <UIKit/UIKit.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
@@ -624,45 +627,49 @@ static void QMKUrlCommit(UIViewController *vc) {
     } @catch (NSException *e) { QMKErr(@"url-commit", e); }
 }
 
-static UIView *QMKFindPanelLabel(UIView *root, int depth) {
-    if (!root || depth > 6) return nil;
-    if ([root isKindOfClass:[UILabel class]]) {
-        UILabel *lb = (UILabel *)root;
-        if ([lb.text isEqualToString:@"控制终端UI面板"]) return root;
-    }
-    for (UIView *v in root.subviews) {
-        UIView *hit = QMKFindPanelLabel(v, depth + 1);
-        if (hit) return hit;
-    }
-    return nil;
-}
-
-// 枚举全部面板 VC (含陈旧实例): 每个含"控制终端UI面板"标签的窗口子树
-static NSArray *QMKFindAllPanelVCs(void) {
+// 收集面板条目 (无界扫描): 标题标签 → responder 链命中 VCamSettingsViewController
+// 得 vc 条目; 未命中得容器兜底条目 (陈旧残留视图, 永不为主面板)
+static NSArray *QMKFindAllPanelEntries(void) {
     @try {
-        NSMutableArray *all = [NSMutableArray array];
+        Class panelCls = NSClassFromString(@"VCamSettingsViewController");
+        NSMutableArray *out = [NSMutableArray array];
+        NSInteger order = 0;
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            NSArray *stack = [w subviews];
+            // 迭代栈遍历, 无深度上限 (v6 有界递归正是漏掉深层旧面板的根因)
+            NSMutableArray *stack = [NSMutableArray arrayWithArray:[w subviews]];
             while (stack.count) {
-                NSMutableArray *next = [NSMutableArray array];
-                for (UIView *sv in stack) {
-                    UIView *lb = QMKFindPanelLabel(sv, 0);
-                    if (lb) {
+                UIView *v = [stack lastObject];
+                [stack removeLastObject];
+                if ([v isKindOfClass:[UILabel class]]) {
+                    UILabel *lb = (UILabel *)v;
+                    if ([lb.text isEqualToString:@"控制终端UI面板"]) {
+                        // 沿 responder 找面板 VC: 面板内容到 VC 最多 2-3 跳,
+                        // 6 跳为上限防止意外深链 (仅此步有界, 非扫描本身)
                         UIResponder *r = lb;
-                        while (r) {
+                        UIViewController *vc = nil;
+                        for (int i = 0; i < 6 && r; i++) {
                             r = r.nextResponder;
-                            if ([r isKindOfClass:[UIViewController class]]) {
-                                if (![all containsObject:r]) [all addObject:r];
+                            if (r && panelCls && [r isKindOfClass:panelCls]) {
+                                vc = (UIViewController *)r;
                                 break;
                             }
                         }
+                        if (vc) {
+                            [out addObject:@{@"kind": @"vc", @"vc": vc, @"view": vc.view,
+                                             @"win": w, @"order": @(order++)}];
+                        } else {
+                            // 无 VC 兜底: 取窗口之下最高祖先作为隐藏目标 (陈旧残留)
+                            UIView *anc = v;
+                            while (anc.superview && anc.superview != w) anc = anc.superview;
+                            [out addObject:@{@"kind": @"container", @"vc": [NSNull null],
+                                             @"view": anc, @"win": w, @"order": @(order++)}];
+                        }
                     }
-                    for (UIView *c in sv.subviews) [next addObject:c];
                 }
-                stack = next;
+                for (UIView *c in [v subviews]) [stack addObject:c];
             }
         }
-        return all;
+        return out;
     } @catch (NSException *e) { QMKErr(@"panel-find", e); }
     return @[];
 }
@@ -686,25 +693,46 @@ static void QMKSuppressEnhancerButton(void) {
 static void QMKTick(void) {
     @try {
         static BOOL lastVisible = NO;
-        // 枚举全部面板实例 (补丁每次展示新建, 旧实例窗口仍可见 → 双面板根因)
-        NSArray *panels = QMKFindAllPanelVCs();
+        static NSInteger lastCount = -1;
+        NSArray *entries = QMKFindAllPanelEntries();
+        if ((NSInteger)entries.count != lastCount) {
+            lastCount = entries.count;
+            QMKInfo([NSString stringWithFormat:@"面板发现 %ld 个实例", (long)entries.count]);
+        }
+        // 主面板 = 可见 vc 条目中 (windowLevel 最高, 其次最新); 容器条目永不为主
         UIViewController *primary = nil;
-        for (UIViewController *vc in panels) {
-            UIView *r = vc ? vc.view : nil;
-            if (!r || r.hidden || !r.window || r.window.hidden) continue;
-            primary = vc; // 最后一个可见实例 = 最上层/最新 = 当前操作面板
+        UIView *primaryView = nil;
+        double bestLevel = -1;
+        NSInteger bestOrder = -1;
+        for (NSDictionary *e in entries) {
+            if (![e[@"kind"] isEqualToString:@"vc"]) continue;
+            UIView *v = e[@"view"];
+            UIWindow *w = e[@"win"];
+            if (!v || v.hidden || !w || w.hidden) continue;
+            double lv = w.windowLevel;
+            NSInteger od = [e[@"order"] integerValue];
+            if (!primaryView || lv > bestLevel || (lv == bestLevel && od > bestOrder)) {
+                bestLevel = lv;
+                bestOrder = od;
+                primaryView = v;
+                primary = e[@"vc"];
+            }
         }
-        // 非主面板整面隐藏: 重复面板/旧 UI 彻底消除 (仅在有主面板时; 收起态不
-        // 动任何根, 防止应用仅靠窗口隐藏/恢复时面板被我们永久藏死)
-        for (UIViewController *vc in panels) {
-            if (primary && vc != primary && vc.view && !vc.view.hidden) vc.view.hidden = YES;
-        }
-        BOOL visible = (primary != nil);
-        if (visible) {
+        // 非主 vc 整面隐藏 + 无 VC 容器兜底隐藏; 仅在有可见主面板时执行
+        // (收起态不动任何根: 应用仅靠窗口隐藏/恢复时面板不能被我们永久藏死)
+        if (primaryView) {
+            for (NSDictionary *e in entries) {
+                UIView *v = e[@"view"];
+                if (v && !v.hidden &&
+                    (v != primaryView || [e[@"kind"] isEqualToString:@"container"])) {
+                    v.hidden = YES;
+                }
+            }
             QMKController().panelVC = primary;
             QMKAttachUnifiedPod(primary);
             QMKRefreshStatus(primary);
         }
+        BOOL visible = (primaryView != nil);
         if (visible != lastVisible) {
             QMKInfo(visible ? @"功能面板已展开" : @"功能面板已收起");
             lastVisible = visible;
@@ -730,7 +758,7 @@ static void QMKInit(void) {
             if (p == QMKProcessOther) return;
             QMKMarkInjected(p);
             if (p == QMKProcessSpringBoard) {
-                QMKInfo(@"VCamExtraKeys LV-4 UI 层已注入 (SpringBoard)");
+                QMKInfo(@"VCamExtraKeys LV-5 UI 层已注入 (SpringBoard)");
                 QMKMigrateLegacyRotation();
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
@@ -739,7 +767,7 @@ static void QMKInit(void) {
                 });
                 return;
             }
-            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-4 帧层已注入 (%@)", QMKProcName(p)]);
+            QMKInfo([NSString stringWithFormat:@"VCamExtraKeys LV-5 帧层已注入 (%@)", QMKProcName(p)]);
             QMKScheduleFrameInstall();
         } @catch (NSException *e) { QMKErr(@"init", e); }
     }
