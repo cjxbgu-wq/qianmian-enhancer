@@ -19,13 +19,15 @@
 //   B3) 首帧日志含格式; 每60帧报数; 10s看门狗; 90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
-// E) 黑屏修复: 旋转缓存 4->16 + 淘汰延迟 2s 释放 (引擎异步渲染滞后数帧持野指针 -> 黑屏)
+// E) 黑屏修复: ① 旋转缓存 4->16 + 淘汰延迟 2s 释放; ② CoreImage 在 mediaserverd
+//     (无 UI 守护进程) 中 render 为空操作 -> 旋转帧全零 -> 黑屏; 已翻译为
+//     CPU 直接像素旋转 (对齐旧项目"像素原位旋转"业务逻辑, 格式保持, 90° 宽高互换)
 // F) 体积优化: 融合 deb 数据成员 data.tar.xz (xz 压缩, 安装更快)
 // D) 输出 LV-7.deb
 #import <UIKit/UIKit.h>
-#import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
+#import <string.h>
 #import <objc/runtime.h>
 
 static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
@@ -176,47 +178,84 @@ static id QMKSafeCall(id target, SEL sel, id arg) {
 #pragma clang diagnostic pop
 }
 
-static CIContext *QMKCI(void) {
-    static CIContext *ctx = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
-    return ctx;
+// 像素平面旋转 (CPU 直接拷贝, bpp=每像素字节): 
+// 90°: dst(列tx, 行ty) = src(行 H-1-tx, 列 ty)   [顺时针, 宽高互换]
+// 180°: dst(tx,ty) = src(W-1-tx, H-1-ty)          [行列全反转]
+// 270°: dst(列tx, 行ty) = src(行 ty, 列 W-1-tx)   [逆时针, 宽高互换]
+static void QMKRotatePlane(uint8_t *src, uint8_t *dst,
+                           size_t W, size_t H,
+                           size_t sbpr, size_t dbpr,
+                           size_t bpp, NSInteger rot) {
+    size_t x, y;
+    if (rot == 90) {
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++)
+                memcpy(dst + x * dbpr + (H - 1 - y) * bpp,
+                       src + y * sbpr + x * bpp, bpp);
+    } else if (rot == 180) {
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++)
+                memcpy(dst + (H - 1 - y) * dbpr + (W - 1 - x) * bpp,
+                       src + y * sbpr + x * bpp, bpp);
+    } else { // 270
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++)
+                memcpy(dst + (W - 1 - x) * dbpr + y * bpp,
+                       src + y * sbpr + x * bpp, bpp);
+    }
 }
 
 static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, NSInteger rot) {
     if (!src || rot == 0) return NULL;
     @try {
-        CIImage *img = [CIImage imageWithCVImageBuffer:src];
+        CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         size_t w = CVPixelBufferGetWidth(src);
         size_t h = CVPixelBufferGetHeight(src);
-        if (w == 0 || h == 0) return NULL;
-        // [对齐旧项目] 旋转结果保持源格式: 核心 YUV 管线要求 420v/420f 输入,
-        // 固定输出 BGRA 会被下游转换丢弃 -> 无效果/黑屏 (用户实测)
+        if (w == 0 || h == 0) {
+            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+            return NULL;
+        }
+        // [黑屏修复] 旧项目为采集端 GPU/CPU 就地旋转; 新框架下 mediaserverd 为
+        // 无 UI 守护进程, CoreImage CIContext render 是空操作 -> 旋转帧全零 -> 黑屏.
+        // 已翻译为 CPU 直接像素旋转 (对齐旧项目"像素原位旋转"业务逻辑),
+        // 格式保持 420v/420f/BGRA (核心 YUV 管线兼容)
         OSType fmt = CVPixelBufferGetPixelFormatType(src);
         if (fmt != kCVPixelFormatType_32BGRA &&
             fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
             fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
             fmt = kCVPixelFormatType_32BGRA;
         }
+        size_t w2 = (rot == 90 || rot == 270) ? h : w;
+        size_t h2 = (rot == 90 || rot == 270) ? w : h;
         NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
         CVPixelBufferRef dst = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h, fmt,
+        CVPixelBufferCreate(kCFAllocatorDefault, w2, h2, fmt,
                             (__bridge CFDictionaryRef)attrs, &dst);
-        if (!dst) { QMKErr(@"rotation-alloc", nil); return NULL; }
-        if (rot == 90)  img = [img imageByApplyingTransform:CGAffineTransformMake(0, 1, -1, 0, h, 0)];
-        if (rot == 180) img = [img imageByApplyingTransform:CGAffineTransformMake(-1, 0, 0, -1, w, h)];
-        if (rot == 270) img = [img imageByApplyingTransform:CGAffineTransformMake(0, -1, 1, 0, 0, w)];
-        CGRect ext = img.extent;
-        if (ext.size.width < 1 || ext.size.height < 1) { CVPixelBufferRelease(dst); return NULL; }
-        CGFloat sx = (CGFloat)w / ext.size.width;
-        CGFloat sy = (CGFloat)h / ext.size.height;
-        CGFloat scale = MAX(sx, sy);
-        img = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-        CGRect se = img.extent;
-        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(
-                   (w - se.size.width) / 2.0, (h - se.size.height) / 2.0)];
-        img = [img imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)];
-        [QMKCI() render:img toCVPixelBuffer:dst];
+        if (!dst) {
+            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+            QMKErr(@"rotation-alloc", nil);
+            return NULL;
+        }
+        CVPixelBufferLockBaseAddress(dst, 0);
+        uint8_t *sbase = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+        uint8_t *dbase = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        size_t sbpr = CVPixelBufferGetBytesPerRow(src);
+        size_t dbpr = CVPixelBufferGetBytesPerRow(dst);
+        if (fmt == kCVPixelFormatType_32BGRA) {
+            QMKRotatePlane(sbase, dbase, w, h, sbpr, dbpr, 4, rot);
+        } else {
+            // 420 双平面: Y (1B) + CbCr 交错 (2B, 尺寸减半)
+            size_t wU = w / 2, hU = h / 2;
+            size_t sUp = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
+            size_t dUp = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+            uint8_t *suv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
+            uint8_t *duv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+            QMKRotatePlane(sbase, dbase, w, h, sbpr, dbpr, 1, rot);
+            if (suv && duv && wU > 0 && hU > 0)
+                QMKRotatePlane(suv, duv, wU, hU, sUp, dUp, 2, rot);
+        }
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         return dst;
     } @catch (NSException *e) {
         QMKErr(@"rotation-apply", e);
