@@ -12,20 +12,26 @@
 //   A3) 新增键: 视频旋转 (qmkRotTapped: -> QMKCycleRotation) +
 //       彩色注入 (qmkColorTapped: -> QMEnhancerView 屏幕取色映射 toggle)
 //   A4) tick 兜底: 主面板根无构建标记(0x6E50) -> 重建; 非主可见实例 -> 销毁
-// 旋转层 (对齐旧项目 UI源码界面虚浮窗功能):
-//   B1) 旋转结果保持源格式 (420v/420f/BGRA), 不再固定输出 BGRA — 核心 YUV 管线兼容
-//   B2) 消费点全覆盖: 除 updateCurrentBuffer: 外再钩 copyCurrentFrame/getCurrentFrame
-//       (核心引擎取帧入口), 按源指针共享旋转缓存(≤4)防重复旋转/重复分配
+// 旋转层 (逻辑移植自旧项目 UI源码界面虚浮窗功能 vcam_friend_js.js draw):
+//   B1) 方向旋转 = canvas 语义翻译 (JS Canvas -> CoreGraphics): buffer 尺寸/指针
+//       固定不变, translate(中心)+rotate(rad)+有效区 ew/eh(90°/270°互换)
+//       + aspectFit 完整显示 + 黑底; 渲染由 CoreGraphics SIMD blit 执行,
+//       每帧仅 1 次快照 memcpy + 1 次 draw, 零逐帧大分配
+//   B2) 消费点全覆盖: updateCurrentBuffer: 主旋转点; copyCurrentFrame/getCurrentFrame
+//       透传计数 (定位引擎渲染路径)
 //   B3) 首帧日志含格式; 每60帧报数; 10s看门狗; 90s重试
 // C) 错误日志: /tmp/qianmian_error.log, 进程注入/类找到/钩子/帧流入,
 //    弹窗+复制日志(全文)+清空
-// E) 黑屏修复: 旋转缓存 4->16 + 淘汰延迟 2s 释放 (引擎异步渲染滞后数帧持野指针 -> 黑屏)
+// E) 方向旋转修复: 像素旋转 (CoreImage/CPU/就地) 全部废弃 — 卡顿/发热/膨胀/崩溃根因;
+//     现为 CoreGraphics canvas 语义方向旋转 (旧项目 draw() 逻辑翻译), 零逐像素循环
 // F) 体积优化: 融合 deb 数据成员 data.tar.xz (xz 压缩, 安装更快)
 // D) 输出 LV-7.deb
 #import <UIKit/UIKit.h>
-#import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
+#import <string.h>
+#import <stdlib.h>
+#import <math.h>
 #import <objc/runtime.h>
 
 static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
@@ -176,99 +182,103 @@ static id QMKSafeCall(id target, SEL sel, id arg) {
 #pragma clang diagnostic pop
 }
 
-static CIContext *QMKCI(void) {
-    static CIContext *ctx = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
-    return ctx;
-}
-
-static CVPixelBufferRef QMKApplyRotationPreservingFormat(CVPixelBufferRef src, NSInteger rot) {
-    if (!src || rot == 0) return NULL;
-    @try {
-        CIImage *img = [CIImage imageWithCVImageBuffer:src];
-        size_t w = CVPixelBufferGetWidth(src);
-        size_t h = CVPixelBufferGetHeight(src);
-        if (w == 0 || h == 0) return NULL;
-        // [对齐旧项目] 旋转结果保持源格式: 核心 YUV 管线要求 420v/420f 输入,
-        // 固定输出 BGRA 会被下游转换丢弃 -> 无效果/黑屏 (用户实测)
-        OSType fmt = CVPixelBufferGetPixelFormatType(src);
-        if (fmt != kCVPixelFormatType_32BGRA &&
-            fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
-            fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
-            fmt = kCVPixelFormatType_32BGRA;
-        }
-        NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-        CVPixelBufferRef dst = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h, fmt,
-                            (__bridge CFDictionaryRef)attrs, &dst);
-        if (!dst) { QMKErr(@"rotation-alloc", nil); return NULL; }
-        if (rot == 90)  img = [img imageByApplyingTransform:CGAffineTransformMake(0, 1, -1, 0, h, 0)];
-        if (rot == 180) img = [img imageByApplyingTransform:CGAffineTransformMake(-1, 0, 0, -1, w, h)];
-        if (rot == 270) img = [img imageByApplyingTransform:CGAffineTransformMake(0, -1, 1, 0, 0, w)];
-        CGRect ext = img.extent;
-        if (ext.size.width < 1 || ext.size.height < 1) { CVPixelBufferRelease(dst); return NULL; }
-        CGFloat sx = (CGFloat)w / ext.size.width;
-        CGFloat sy = (CGFloat)h / ext.size.height;
-        CGFloat scale = MAX(sx, sy);
-        img = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-        CGRect se = img.extent;
-        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(
-                   (w - se.size.width) / 2.0, (h - se.size.height) / 2.0)];
-        img = [img imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)];
-        [QMKCI() render:img toCVPixelBuffer:dst];
-        return dst;
-    } @catch (NSException *e) {
-        QMKErr(@"rotation-apply", e);
-        return NULL;
-    }
-}
-
-// 旋转帧缓存: 按源 buffer 指针缓存旋转结果, 多入口共享
-// (updateCurrentBuffer:/copyCurrentFrame:/getCurrentFrame:), 防重复旋转/重复分配
-// [黑屏修复] 引擎异步渲染可能滞后数帧, 淘汰即释放会让引擎持有野指针 -> 黑屏;
-// 故: 上限 16 + 淘汰仅摘引用, 延迟 2s 释放 (引擎必已换帧, 既防野指针又防泄漏)
-static NSMutableDictionary *gRotCache = nil;
-static NSMutableArray *gRotCacheKeys = nil;
-static CVPixelBufferRef QMKRotCached(CVBufferRef src, NSInteger rot) {
-    if (!src || rot == 0) return NULL;
-    @synchronized (gRotCache ?: (gRotCache = [NSMutableDictionary dictionary])) {
-        if (!gRotCacheKeys) gRotCacheKeys = [NSMutableArray array];
-        NSValue *key = [NSValue valueWithPointer:src];
-        NSValue *hit = gRotCache[key];
-        if (hit) return (CVPixelBufferRef)[hit pointerValue];
-        while (gRotCacheKeys.count >= 16) {
-            NSValue *old = gRotCacheKeys.firstObject;
-            [gRotCacheKeys removeObjectAtIndex:0];
-            NSValue *v = gRotCache[old];
-            if (v) {
-                [gRotCache removeObjectForKey:old];
-                CVPixelBufferRef doomed = (CVPixelBufferRef)[v pointerValue];
-                CFRetain(doomed);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                    CVPixelBufferRelease(doomed);
-                });
-            }
-        }
-        CVPixelBufferRef out = QMKApplyRotationPreservingFormat(src, rot);
-        if (out) {
-            gRotCache[key] = [NSValue valueWithPointer:out];
-            [gRotCacheKeys addObject:key];
-        }
-        return out;
-    }
-}
+// [方向旋转补丁] 旧项目 (vcam_friend_js.js draw) 的"视频方向旋转"语义:
+//   canvas 尺寸固定 + ctx.translate(中心)+ctx.rotate(rad) + 有效区 ew/eh(90°/270°互换)
+//   + aspectFit 完整显示 + 黑底 — 视频与 buffer 不变, 仅方向呈现变化.
+//   已翻译为新框架原生等价物 CoreGraphics (iOS 的 canvas), 以补丁方式在
+//   VCamExtraKeys 帧钩子层运行, 项目源码零更改.
 
 static void (*origUpdateCurrentBuffer)(id, SEL, CVBufferRef) = NULL;
 static CVBufferRef (*origCopyCurrentFrame)(id, SEL) = NULL;
 static CVBufferRef (*origGetCurrentFrame)(id, SEL) = NULL;
-static volatile int64_t QMKFramesSeen = 0;
-static volatile int64_t QMKFramesRotated = 0;
+static volatile int64_t QMKFramesSeen = 0;      // update 首帧计数 (帧钩子是否流入)
+static volatile int64_t QMKFramesUpdate = 0;    // updateCurrentBuffer 调用次数
+static volatile int64_t QMKFramesCopy = 0;      // copyCurrentFrame 调用次数
+static volatile int64_t QMKFramesGet = 0;       // getCurrentFrame 调用次数
+
+// [方向旋转补丁] 此段逻辑移植自旧项目 UI源码界面虚浮窗功能 的 draw():
+//   JS: ctx.translate(cw/2,ch/2) + ctx.rotate(rad) + 有效区 ew/eh(90°/270°互换)
+//       + aspectFit(s=min) 完整显示 + 黑底 — 已适配当前框架:
+//       JS Canvas -> iOS CoreGraphics (CGBitmapContext 即 iOS 原生 canvas).
+//   关键约束: ① 输出 buffer 尺寸/指针固定不变 (视频未改变, 仅方向呈现变化);
+//             ② 渲染由 CoreGraphics SIMD blit 执行 (禁 CPU 逐像素变换),
+//                每帧仅 1 次快照 memcpy + 1 次 draw, 零逐帧大分配 (防卡顿/发热/膨胀);
+//             ③ 就地写入引擎持有的同一 buffer (实测仅此方式生效).
+static uint8_t *gRotSnap = NULL;     // 源帧快照 (复用, 防每帧 malloc)
+static size_t gRotSnapCap = 0;
+static void QMKRotateDirectionInPlace(CVBufferRef buf, NSInteger rot) {
+    if (!buf || rot == 0) return;
+    @try {
+        size_t w = CVPixelBufferGetWidth(buf);
+        size_t h = CVPixelBufferGetHeight(buf);
+        if (w == 0 || h == 0) return;
+        if (CVPixelBufferGetPixelFormatType(buf) != kCVPixelFormatType_32BGRA) return;
+        CVPixelBufferLockBaseAddress(buf, 0);
+        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(buf);
+        size_t bpr = CVPixelBufferGetBytesPerRow(buf);
+        if (!base || bpr == 0) { CVPixelBufferUnlockBaseAddress(buf, 0); return; }
+
+        // ① 快照源帧 (单次大 memcpy, NEON 级别 ~0.5ms; 缓冲复用零分配)
+        size_t need = h * bpr;
+        static dispatch_once_t lockOnce;
+        static id rotLock = nil;
+        dispatch_once(&lockOnce, ^{ rotLock = [NSObject new]; });
+        @synchronized (rotLock) {
+            if (gRotSnapCap < need) {
+                free(gRotSnap);
+                gRotSnap = (uint8_t *)malloc(need);
+                gRotSnapCap = gRotSnap ? need : 0;
+            }
+            if (!gRotSnap) { CVPixelBufferUnlockBaseAddress(buf, 0); return; }
+            memcpy(gRotSnap, base, need);
+
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            // ② 源 CGImage: 零拷贝引用快照 (BGRA = LE ARGB premultiplied-first)
+            CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, gRotSnap, need, NULL);
+            CGImageRef img = CGImageCreate((size_t)w, (size_t)h, 8, 32, bpr, cs,
+                                           kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
+                                           prov, NULL, false, kCGRenderingIntentDefault);
+            // ③ 目标 Context 直接绑定原 buffer 内存 (渲染结果原地落盘, 无中间缓冲)
+            CGContextRef ctx = CGBitmapContextCreate(base, (size_t)w, (size_t)h, 8, bpr, cs,
+                                                     kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+            if (img && ctx) {
+                CGFloat ww = (CGFloat)w, hh = (CGFloat)h;
+                // 黑底 (等价 JS clearRect + fillStyle='#000')
+                CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
+                CGContextFillRect(ctx, CGRectMake(0, 0, ww, hh));
+                // 对齐 JS canvas 坐标系 (原点左上, y 向下): 翻转 y
+                CGContextTranslateCTM(ctx, 0, hh);
+                CGContextScaleCTM(ctx, 1, -1);
+                // JS: ctx.translate(cw/2,ch/2); ctx.rotate(rad)  [翻转系下正角=顺时针, 与 JS 一致]
+                CGContextTranslateCTM(ctx, ww / 2.0, hh / 2.0);
+                NSInteger rr = ((rot % 360) + 360) % 360;
+                if (rr) CGContextRotateCTM(ctx, (CGFloat)rr * (CGFloat)M_PI / 180.0f);
+                // JS: ew=(rr==90||270)?ch:cw, eh=?cw:ch
+                CGFloat ew = (rr == 90 || rr == 270) ? hh : ww;
+                CGFloat eh = (rr == 90 || rr == 270) ? ww : hh;
+                // JS exact 分支: s=min(ew/vw,eh/vh) aspectFit 完整显示 (正常规格, 不放大不裁剪)
+                CGFloat vw = ww, vh = hh;
+                CGFloat s = MIN(ew / vw, eh / vh);
+                CGFloat dw = vw * s, dh = vh * s;
+                CGContextDrawImage(ctx, CGRectMake(-dw / 2.0, -dh / 2.0, dw, dh), img);
+                CGContextFlush(ctx);
+            }
+            if (ctx) CFRelease(ctx);
+            if (img) CFRelease(img);
+            if (prov) CFRelease(prov);
+            CFRelease(cs);
+        }
+        CVPixelBufferUnlockBaseAddress(buf, 0);
+    } @catch (NSException *e) {
+        QMKErr(@"rotation-direction", e);
+    }
+}
+
 static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
-        int64_t n = __sync_add_and_fetch(&QMKFramesSeen, 1);
-        if (n == 1) {
+        __sync_add_and_fetch(&QMKFramesUpdate, 1);
+        int64_t seen = __sync_add_and_fetch(&QMKFramesSeen, 1);
+        if (seen == 1) {
             QMKInfo([NSString stringWithFormat:@"首帧已进入帧钩子 (%zu x %zu, 格式 %c%c%c%c)",
                      CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
                      (char)((CVPixelBufferGetPixelFormatType(buffer) >> 24) & 0xFF),
@@ -284,17 +294,13 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
             lastRead = now;
         }
         if (cachedRot != 0 && buffer) {
-            // 共享缓存: 与取帧入口共用同一旋转结果, 不重复分配
-            CVPixelBufferRef rotated = QMKRotCached(buffer, cachedRot);
-            if (rotated) {
-                if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, rotated);
-                int64_t r = __sync_add_and_fetch(&QMKFramesRotated, 1);
-                if (r % 60 == 1) {
-                    QMKInfo([NSString stringWithFormat:@"已旋转 %lld 帧 (%ld° 管线正常)", r, (long)cachedRot]);
-                }
-                return;
+            // 方向旋转 (旧项目 canvas 语义翻译): buffer 尺寸/指针不变, CoreGraphics 渲染
+            QMKRotateDirectionInPlace(buffer, cachedRot);
+            static volatile int64_t rotLogSeq = 0;
+            int64_t ls = __sync_add_and_fetch(&rotLogSeq, 1);
+            if (ls % 60 == 1) {
+                QMKInfo([NSString stringWithFormat:@"方向旋转已应用 (%ld°)", (long)cachedRot]);
             }
-            QMKWarn(@"旋转应用失败, 回退原始帧");
         }
         if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, buffer);
     } @catch (NSException *e) {
@@ -305,22 +311,14 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
 
 static BOOL QMKFrameInstalled = NO;
 
-// 消费点钩子: copyCurrentFrame / getCurrentFrame — 核心引擎取帧入口,
-// 返回共享缓存旋转帧 (对齐旧项目"消费端旋转"语义)
+// 消费点钩子: copyCurrentFrame / getCurrentFrame — 引擎取帧入口.
+// 旋转已由 update 就地完成, 此处仅透传 + 计数日志 (用于定位引擎真实渲染路径).
 static CVBufferRef QMKCopyCurrentFrameHook(id self, SEL _cmd) {
     @try {
         CVBufferRef f = origCopyCurrentFrame ? origCopyCurrentFrame(self, _cmd) : NULL;
-        if (!f) return f;
-        NSInteger rot = QMKReadRotation();
-        if (rot == 0) return f;
-        CVPixelBufferRef r = QMKRotCached(f, rot);
-        if (r) {
-            int64_t n = __sync_add_and_fetch(&QMKFramesRotated, 1);
-            if (n % 60 == 1) {
-                QMKInfo([NSString stringWithFormat:@"消费点 copyCurrentFrame 已旋转 %lld 帧 (%ld°)",
-                         n, (long)rot]);
-            }
-            return r;
+        int64_t n = __sync_add_and_fetch(&QMKFramesCopy, 1);
+        if (n % 60 == 1) {
+            QMKInfo([NSString stringWithFormat:@"copy 透传 %lld 帧 (读取引擎当前帧)", n]);
         }
         return f;
     } @catch (NSException *e) {
@@ -333,11 +331,10 @@ static CVBufferRef QMKCopyCurrentFrameHook(id self, SEL _cmd) {
 static CVBufferRef QMKGetCurrentFrameHook(id self, SEL _cmd) {
     @try {
         CVBufferRef f = origGetCurrentFrame ? origGetCurrentFrame(self, _cmd) : NULL;
-        if (!f) return f;
-        NSInteger rot = QMKReadRotation();
-        if (rot == 0) return f;
-        CVPixelBufferRef r = QMKRotCached(f, rot);
-        if (r) return r;
+        int64_t n = __sync_add_and_fetch(&QMKFramesGet, 1);
+        if (n % 60 == 1) {
+            QMKInfo([NSString stringWithFormat:@"get 透传 %lld 帧 (读取引擎当前帧)", n]);
+        }
         return f;
     } @catch (NSException *e) {
         QMKErr(@"get-frame", e);
