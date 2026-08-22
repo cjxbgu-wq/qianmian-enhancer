@@ -773,6 +773,8 @@ static void QMKEndColorPick(BOOL doPick) {
                     UIColor *col = [UIColor colorWithRed:pix[0] / 255.0 green:pix[1] / 255.0 blue:pix[2] / 255.0 alpha:1];
                     // [键名对齐] 从 QMEnhancerView.dylib 符号提取的真实设置键:
                     //   mappingColor (取色颜色) + colorMappingEnabled (开关) + colorMixIntensity (强度)
+                    // [注入强化] 双通道写入: ① 实例 setter (内存直设 UIColor, 无 plist 序列化
+                    //   丢失风险) ② saveSharedSettings: 持久化 — 确保帧管线 processFrame 读到
                     Class enh = NSClassFromString(@"QMEnhancerView");
                     NSMutableDictionary *s = [NSMutableDictionary dictionary];
                     if ([enh respondsToSelector:@selector(sharedSettings)]) {
@@ -781,6 +783,19 @@ static void QMKEndColorPick(BOOL doPick) {
                     }
                     s[@"mappingColor"] = col;
                     s[@"colorMappingEnabled"] = @YES;
+                    if (![s objectForKey:@"colorMixIntensity"]) s[@"colorMixIntensity"] = @0.6;
+                    id inst = ([enh respondsToSelector:@selector(sharedInstance)])
+                              ? QMKSafeCall(enh, @selector(sharedInstance), nil) : nil;
+                    if (inst) {
+                        if ([inst respondsToSelector:@selector(setMappingColor:)])
+                            QMKSafeCall(inst, @selector(setMappingColor:), col);
+                        if ([inst respondsToSelector:@selector(setColorMixIntensity:)])
+                            QMKSafeCall(inst, @selector(setColorMixIntensity:), @0.6);
+                        if ([inst respondsToSelector:@selector(setColorMappingEnabled:)])
+                            QMKSafeCall(inst, @selector(setColorMappingEnabled:), @YES);
+                        if ([inst respondsToSelector:@selector(saveCurrentSettings)])
+                            QMKSafeCall(inst, @selector(saveCurrentSettings), nil);
+                    }
                     if ([enh respondsToSelector:@selector(saveSharedSettings:)])
                         QMKSafeCall(enh, @selector(saveSharedSettings:), s);
                     QMKInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) -> mappingColor 已注入",
@@ -819,6 +834,26 @@ static void QMKStartColorPick(void) {
         tip.clipsToBounds = YES;
         tip.userInteractionEnabled = NO;
         [ov addSubview:tip];
+
+        // [模拟测试色块] 标准纯色块 (红/绿/蓝): 光标拖到色块上点击必吸精确 RGB,
+        // 用于验证取色->mappingColor 注入->视频颜色波动 渲染链路
+        NSArray *blocks = @[[UIColor colorWithRed:1 green:0 blue:0 alpha:1],
+                            [UIColor colorWithRed:0 green:1 blue:0 alpha:1],
+                            [UIColor colorWithRed:0 green:0 blue:1 alpha:1]];
+        for (int i = 0; i < 3; i++) {
+            UIView *blk = [[UIView alloc] initWithFrame:CGRectMake(16 + i * 56, 96, 48, 48)];
+            blk.backgroundColor = blocks[i];
+            blk.layer.borderWidth = 1;
+            blk.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.6].CGColor;
+            blk.userInteractionEnabled = NO;   // 不拦截触摸, 点击穿透到 overlay=正常取色
+            [ov addSubview:blk];
+        }
+        UILabel *blkLab = [[UILabel alloc] initWithFrame:CGRectMake(16, 148, 168, 14)];
+        blkLab.text = @"↑ 标准色块 (测试取色用)";
+        blkLab.font = [UIFont systemFontOfSize:9];
+        blkLab.textColor = [UIColor colorWithWhite:1 alpha:0.7];
+        blkLab.userInteractionEnabled = NO;
+        [ov addSubview:blkLab];
 
         // 可拖动十字光标 (QMKPickCursor: touchesMoved 自由拖动)
         QMKPickCursor *cur = [[QMKPickCursor alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
