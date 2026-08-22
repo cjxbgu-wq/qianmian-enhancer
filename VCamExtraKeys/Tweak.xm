@@ -352,16 +352,27 @@ static void VPMFramePickSample(CVBufferRef buf) {
         // SpringBoard 侧轮询在安全环境执行.
         [[NSString stringWithFormat:@"%d,%d,%d", R, G, B]
             writeToFile:VPMResultFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        UIColor *col = [UIColor colorWithRed:R / 255.0 green:G / 255.0 blue:B / 255.0 alpha:1];
-        NSData *colData = [NSKeyedArchiver archivedDataWithRootObject:col
-                                         requiringSecureCoding:NO error:nil];
-        NSMutableDictionary *s = [NSMutableDictionary dictionaryWithContentsOfFile:VPMSharedSettingsPath]
-                                 ?: [NSMutableDictionary dictionary];
-        if (colData) s[@"mappingColor"] = colData;
-        s[@"colorMappingEnabled"] = @YES;
-        if (![s objectForKey:@"colorMixIntensity"]) s[@"colorMixIntensity"] = @0.6;
-        [s writeToFile:VPMSharedSettingsPath atomically:YES];
+        // [毒源根除] 不再向共享 plist 写任何 mappingColor 数据 — 上一版写入的
+        // UIColor 归档 data 与增强模块原生格式不符, 其读取时 unrecognized selector
+        // 导致 SpringBoard 两次崩溃 (实测). 颜色传递仅走: result 文件 -> SpringBoard
+        // 主线程 setter (内存直设) -> 增强模块自身 saveCurrentSettings 原生持久化.
     } @catch (NSException *e) { VPMErr(@"frame-pick", e); }
+}
+
+// [自愈清理] 移除历史版本遗留的毒数据: mappingColor 若为 NSData(归档)/其他非
+// 字符串类型, 增强模块/面板读取即崩. 启动与开启取色前各执行一次.
+static void VPMSanitizeSettings(void) {
+    @try {
+        NSMutableDictionary *s = [NSMutableDictionary dictionaryWithContentsOfFile:VPMSharedSettingsPath];
+        if (!s) return;
+        id mc = s[@"mappingColor"];
+        BOOL poisoned = mc && ![mc isKindOfClass:[NSString class]];
+        if (poisoned) {
+            [s removeObjectForKey:@"mappingColor"];
+            [s writeToFile:VPMSharedSettingsPath atomically:YES];
+            VPMInfo(@"设置自愈: 已移除非原生 mappingColor 毒数据");
+        }
+    } @catch (NSException *e) {}
 }
 
 static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
@@ -820,40 +831,56 @@ static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
     }
     return self;
 }
-// 四角括号 + 中心十字 (人脸识别对焦框样式, 尺寸自适应)
+// [标准射击准星] 外圈圆环 + 四方向延伸十字线 + 中心点, 发光描边
 - (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     CGFloat w = rect.size.width, h = rect.size.height;
-    CGFloat L = w * 0.30;                       // 角长
-    CGFloat in = 2;                             // 内缩
-    CGColorRef c = [UIColor colorWithRed:0.35 green:1 blue:0.65 alpha:0.98].CGColor;
-    CGContextSetStrokeColorWithColor(ctx, c);
-    CGContextSetLineWidth(ctx, 2.5);
-    CGContextSetLineCap(ctx, kCGLineCapRound);
-    CGPoint corners[8][2] = {
-        { CGPointMake(in, in + L), CGPointMake(in, in) },             // 左上
-        { CGPointMake(in, in),     CGPointMake(in + L, in) },
-        { CGPointMake(w - in - L, in), CGPointMake(w - in, in) },     // 右上
-        { CGPointMake(w - in, in), CGPointMake(w - in, in + L) },
-        { CGPointMake(w - in, h - in - L), CGPointMake(w - in, h - in) }, // 右下
-        { CGPointMake(w - in, h - in), CGPointMake(w - in - L, h - in) },
-        { CGPointMake(in + L, h - in), CGPointMake(in, h - in) },     // 左下
-        { CGPointMake(in, h - in), CGPointMake(in, h - in - L) },
-    };
-    for (int i = 0; i < 8; i += 2) {
+    CGFloat cx = w / 2.0, cy = h / 2.0;
+    CGFloat ringR = MIN(w, h) * 0.28;           // 圆环半径
+    CGFloat tick = w * 0.22;                    // 十字线延伸长度 (自边缘向内)
+    CGColorRef glow = [UIColor colorWithRed:0.35 green:1 blue:0.65 alpha:0.98].CGColor;
+    // 外发光 (多层低透明描边模拟)
+    for (int i = 3; i >= 1; i--) {
+        CGContextSetStrokeColorWithColor(ctx,
+            [UIColor colorWithRed:0.35 green:1 blue:0.65 alpha:0.10 * (4 - i)].CGColor);
+        CGContextSetLineWidth(ctx, 2.5 + i * 1.6);
         CGContextBeginPath(ctx);
-        CGContextMoveToPoint(ctx, corners[i][0].x, corners[i][0].y);
-        CGContextAddLineToPoint(ctx, corners[i+1][0].x, corners[i+1][0].y);
+        CGContextAddArc(ctx, cx, cy, ringR, 0, M_PI * 2);
         CGContextStrokePath(ctx);
     }
-    // 中心十字
-    CGContextSetStrokeColorWithColor(ctx, [UIColor whiteColor].CGColor);
-    CGContextSetLineWidth(ctx, 1.5);
-    CGFloat cx = w / 2.0, cy = h / 2.0, a = 5;
+    // 主圆环
+    CGContextSetStrokeColorWithColor(ctx, glow);
+    CGContextSetLineWidth(ctx, 2.5);
+    CGContextSetLineCap(ctx, kCGLineCapRound);
     CGContextBeginPath(ctx);
-    CGContextMoveToPoint(ctx, cx - a, cy); CGContextAddLineToPoint(ctx, cx + a, cy);
-    CGContextMoveToPoint(ctx, cx, cy - a); CGContextAddLineToPoint(ctx, cx, cy + a);
+    CGContextAddArc(ctx, cx, cy, ringR, 0, M_PI * 2);
     CGContextStrokePath(ctx);
+    // 四方向十字线: 从视图边缘指向圆环 (留出与环之间空隙)
+    CGContextSetLineWidth(ctx, 2.0);
+    CGFloat gap = ringR + 5;                    // 环外空隙
+    CGPoint seg[4][2] = {
+        { CGPointMake(cx, 1),            CGPointMake(cx, cy - gap) },   // 上
+        { CGPointMake(w - 1, cy),        CGPointMake(cx + gap, cy) },   // 右
+        { CGPointMake(cx, h - 1),        CGPointMake(cx, cy + gap) },   // 下
+        { CGPointMake(1, cy),            CGPointMake(cx - gap, cy) },   // 左
+    };
+    for (int i = 0; i < 4; i++) {
+        CGContextBeginPath(ctx);
+        CGContextMoveToPoint(ctx, seg[i][0].x, seg[i][0].y);
+        CGContextAddLineToPoint(ctx, seg[i][1].x, seg[i][1].y);
+        CGContextStrokePath(ctx);
+    }
+    // 中心点
+    CGContextSetFillColorWithColor(ctx, [UIColor whiteColor].CGColor);
+    CGContextFillEllipseInRect(ctx, CGRectMake(cx - 2, cy - 2, 4, 4));
+}
+// 取色后预览块颜色更新时轻微脉冲 (取色反馈)
+- (void)setPreviewColor:(UIColor *)col {
+    self.preview.backgroundColor = col;
+    [UIView animateWithDuration:0.18 animations:^{ self.preview.transform = CGAffineTransformMakeScale(1.25, 1.25); }
+                     completion:^(BOOL f) {
+        [UIView animateWithDuration:0.18 animations:^{ self.preview.transform = CGAffineTransformIdentity; }];
+    }];
 }
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
     UITouch *t = touches.anyObject;
@@ -922,22 +949,20 @@ static void VPMPollPickResult(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
                 if ([gPickCursor isKindOfClass:[VPMPickCursor class]])
-                    ((VPMPickCursor *)gPickCursor).preview.backgroundColor = col;
+                    [(VPMPickCursor *)gPickCursor setPreviewColor:col];
             } @catch (NSException *e) {}
         });
         // [setter 注入] 主线程 + 增强模块单例 (面板同款运行环境, 安全)
+        // 精简面: 仅 mappingColor + 开关两项 (saveCurrentSettings/Intensity 内部链
+        // 曾触发崩溃, 移出崩溃面)
         Class enh = NSClassFromString(@"QMEnhancerView");
         id inst = ([enh respondsToSelector:@selector(sharedInstance)])
                   ? VPMSafeCall(enh, @selector(sharedInstance), nil) : nil;
         if (inst) {
             if ([inst respondsToSelector:@selector(setMappingColor:)])
                 VPMSafeCall(inst, @selector(setMappingColor:), col);
-            if ([inst respondsToSelector:@selector(setColorMixIntensity:)])
-                VPMSafeCall(inst, @selector(setColorMixIntensity:), @0.6);
             if ([inst respondsToSelector:@selector(setColorMappingEnabled:)])
                 VPMSafeCall(inst, @selector(setColorMappingEnabled:), @YES);
-            if ([inst respondsToSelector:@selector(saveCurrentSettings)])
-                VPMSafeCall(inst, @selector(saveCurrentSettings), nil);
             VPMInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) 已注入渲染",
                      (int)(r*255), (int)(g*255), (int)(b*255)]);
         } else {
@@ -957,6 +982,7 @@ static void VPMStopPickMode(void) {
 }
 
 static void VPMStartColorPick(void) {
+    VPMSanitizeSettings();   // 开启前自愈: 清历史毒数据
     if (gPickOverlay.superview) { VPMStopPickMode(); return; }  // 再点彩色键=停止取色, 光标消失
     @try {
         // 挂载到现有 keyWindow (SpringBoard 无独立渲染 scene 的自建 UIWindow)
