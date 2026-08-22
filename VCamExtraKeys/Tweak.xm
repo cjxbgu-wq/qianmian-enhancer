@@ -326,7 +326,7 @@ static void VPMFramePickSample(CVBufferRef buf) {
         NSString *pt = [NSString stringWithContentsOfFile:VPMPointFile
                                                  encoding:NSUTF8StringEncoding error:nil];
         if (!pt.length) return;
-        [NSFileManager defaultManager removeItemAtPath:VPMPointFile error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:VPMPointFile error:nil];
         NSArray *parts = [pt componentsSeparatedByString:@","];
         if (parts.count < 2) return;
         double fx = [parts[0] doubleValue], fy = [parts[1] doubleValue];
@@ -889,8 +889,8 @@ static void VPMEndColorPick(BOOL doPick) {
             // 光标中心 -> 屏幕比例坐标 (0..1), 发送给帧层采样
             CGRect sb = [UIScreen mainScreen].bounds;
             CGPoint c = gPickCursor.center;
-            double fx = sb.width > 0 ? c.x / sb.width : 0;
-            double fy = sb.height > 0 ? c.y / sb.height : 0;
+            double fx = sb.size.width > 0 ? c.x / sb.size.width : 0;
+            double fy = sb.size.height > 0 ? c.y / sb.size.height : 0;
             if (fx < 0) fx = 0; if (fx > 1) fx = 1;
             if (fy < 0) fy = 0; if (fy > 1) fy = 1;
             NSString *payload = [NSString stringWithFormat:@"%.6f,%.6f", fx, fy];
