@@ -32,6 +32,9 @@
 #import <string.h>
 #import <stdlib.h>
 #import <math.h>
+#import <signal.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import <objc/runtime.h>
 
 static NSString *const VPMSharedSettingsPath = @"/tmp/qianmian_enhancer_settings.plist";
@@ -133,6 +136,36 @@ static void VPMInfo(NSString *msg) { VPMLogLine(@"INFO", nil, msg); }
 static void VPMWarn(NSString *msg) { VPMLogLine(@"WARN", nil, msg); }
 static void VPMErr(NSString *tag, NSException *e) {
     VPMLogLine(@"ERR", tag, [NSString stringWithFormat:@"%@: %@", e.name, e.reason]);
+}
+
+// [崩溃黑匣子] 致命信号处理 (async-signal-safe: 仅 open/write/close)
+#include <signal.h>
+static void VPMSignalHandler(int sig) {
+    const char *name = (sig == SIGABRT) ? "SIGABRT"
+                     : (sig == SIGSEGV) ? "SIGSEGV"
+                     : (sig == SIGBUS)  ? "SIGBUS"
+                     : (sig == SIGILL)  ? "SIGILL"
+                     : (sig == SIGFPE)  ? "SIGFPE" : "SIG?";
+    int fd = open("/tmp/vcampro_max.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        const char *pre = "[FATAL] ";
+        write(fd, pre, 8);
+        const char *n = name;
+        while (*n) { write(fd, n, 1); n++; }
+        const char *sfx = " 进程崩溃 (黑匣子捕获)\n";
+        while (*sfx) { write(fd, sfx, 1); sfx++; }
+        close(fd);
+    }
+    signal(sig, SIG_DFL);   // 恢复默认 -> 系统仍生成标准 crash report
+    raise(sig);
+}
+// 未捕获 NSException: 完整堆栈写入日志
+static void VPMUncaughtExceptionHandler(NSException *e) {
+    @try {
+        VPMLogLine(@"FATAL", @"uncaught",
+            [NSString stringWithFormat:@"%@: %@\n%@\n[堆栈结束]",
+             e.name, e.reason, e.callStackSymbols]);
+    } @catch (id _) {}
 }
 
 static NSString *VPMFullLog(void) {
@@ -1540,6 +1573,17 @@ static void VPMInit(void) {
         @try {
             VPMProcess p = VPMProc();
             if (p == VPMProcessOther) return;
+            // [崩溃黑匣子] 捕获致命信号与未捕获异常写入日志 — 定位间歇性
+            // SpringBoard 崩溃真凶 (无标准 crash report 可依时的诊断手段)
+            static dispatch_once_t crashOnce;
+            dispatch_once(&crashOnce, ^{
+                NSSetUncaughtExceptionHandler(VPMUncaughtExceptionHandler);
+                signal(SIGABRT, VPMSignalHandler);
+                signal(SIGSEGV, VPMSignalHandler);
+                signal(SIGBUS,  VPMSignalHandler);
+                signal(SIGILL,  VPMSignalHandler);
+                signal(SIGFPE,  VPMSignalHandler);
+            });
             VPMMarkInjected(p);
             if (p == VPMProcessSpringBoard) {
                 VPMInfo(@"VCamPro Max UI 层已注入 (SpringBoard)");
