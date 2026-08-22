@@ -38,6 +38,7 @@ static NSString *const QMKSharedSettingsPath = @"/tmp/qianmian_enhancer_settings
 static NSString *const QMKErrorLogPath       = @"/tmp/qianmian_error.log";
 static NSString *const QMKRotationKey        = @"videoRotationLV";
 static NSString *const QMKLegacyRotationKey  = @"videoRotation";
+static NSString *const QMKScaleKey           = @"videoScaleLV";
 
 static const NSInteger QMK_TAG_ROT  = 0x6E31;
 static const NSInteger QMK_TAG_LOG  = 0x6E33;
@@ -48,6 +49,7 @@ static const NSInteger QMK_TAG_BAL  = 0x6E37;
 static const NSInteger QMK_TAG_TUT  = 0x6E3B;
 static const NSInteger QMK_TAG_CLS  = 0x6E3C;
 static const NSInteger QMK_TAG_COL  = 0x6E3D; // 彩色注入
+static const NSInteger QMK_TAG_SCL  = 0x6E3E; // 视频缩放
 static const NSInteger QMK_TAG_OWN  = 0x6E50; // 我方整面重建的构建标记 (根视图)
 
 static const NSInteger VP_TAG_BADGE    = 0x6B62;
@@ -148,6 +150,28 @@ static NSInteger QMKReadRotation(void) {
     return (r == 90 || r == 180 || r == 270) ? r : 0;
 }
 
+// [视频缩放补丁] 渲染层等比缩放 (CoreGraphics 变换), 不改像素数据/格式/帧率.
+// 档位循环: 1.0 -> 1.5 -> 2.0 (放大) -> 0.8 (缩小) -> 1.0
+static const CGFloat QMKScaleSteps[4] = {1.0f, 1.5f, 2.0f, 0.8f};
+static CGFloat QMKReadScale(void) {
+    CGFloat s = [[QMKReadSettings() objectForKey:QMKScaleKey] floatValue];
+    return (s > 0.05f && s < 20.0f) ? s : 1.0f;
+}
+static NSInteger QMKScaleIndex(void) {
+    CGFloat s = QMKReadScale();
+    for (NSInteger i = 0; i < 4; i++)
+        if (fabs(QMKScaleSteps[i] - s) < 0.01f) return i;
+    return 0;
+}
+static CGFloat QMKCycleScale(void) {
+    NSMutableDictionary *s = [NSMutableDictionary dictionaryWithDictionary:QMKReadSettings()];
+    NSInteger next = (QMKScaleIndex() + 1) % 4;
+    [s setObject:@(QMKScaleSteps[next]) forKey:QMKScaleKey];
+    QMKWriteSettings(s);
+    QMKInfo([NSString stringWithFormat:@"视频缩放 -> %.2fx", QMKScaleSteps[next]]);
+    return QMKScaleSteps[next];
+}
+
 static NSInteger QMKCycleRotation(void) {
     NSMutableDictionary *s = [NSMutableDictionary dictionaryWithDictionary:QMKReadSettings()];
     NSInteger next = (QMKReadRotation() + 90) % 360;
@@ -206,8 +230,8 @@ static volatile int64_t QMKFramesGet = 0;       // getCurrentFrame 调用次数
 //             ③ 就地写入引擎持有的同一 buffer (实测仅此方式生效).
 static uint8_t *gRotSnap = NULL;     // 源帧快照 (复用, 防每帧 malloc)
 static size_t gRotSnapCap = 0;
-static void QMKRotateDirectionInPlace(CVBufferRef buf, NSInteger rot) {
-    if (!buf || rot == 0) return;
+static void QMKRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat scale) {
+    if (!buf || (rot == 0 && fabs(scale - 1.0f) < 0.01f)) return;
     @try {
         size_t w = CVPixelBufferGetWidth(buf);
         size_t h = CVPixelBufferGetHeight(buf);
@@ -256,6 +280,10 @@ static void QMKRotateDirectionInPlace(CVBufferRef buf, NSInteger rot) {
                 CGContextTranslateCTM(ctx, ww / 2.0, hh / 2.0);
                 NSInteger rr = ((rot % 360) + 360) % 360;
                 if (rr) CGContextRotateCTM(ctx, -(CGFloat)rr * (CGFloat)M_PI / 180.0f);
+                // [视频缩放] 渲染层等比缩放 (围绕中心), 不改像素数据/格式/帧率;
+                // >1 放大溢出部分由 buffer 边界自然裁剪, <1 缩小露黑底
+                if (scale > 0 && fabs(scale - 1.0f) > 0.01f)
+                    CGContextScaleCTM(ctx, scale, scale);
                 // JS exact 分支对齐 (人脸识别场景): aspectFit s=min — 完整面目及景象,
                 // 不裁剪任何内容 (裁剪过大过多会导致无法识别人脸);
                 // rotate(+rad)=顺时针 上->右->下->左, 已按 CG 真实行为逐点仿真验证
@@ -291,19 +319,21 @@ static void QMKUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
                      (char)(CVPixelBufferGetPixelFormatType(buffer) & 0xFF)]);
         }
         static NSInteger cachedRot = -1;
+        static CGFloat cachedScale = -1.0;
         static double lastRead = 0;
         double now = [NSDate timeIntervalSinceReferenceDate];
-        if (cachedRot < 0 || (now - lastRead) > 0.5) {
+        if (cachedRot < 0 || cachedScale < 0 || (now - lastRead) > 0.5) {
             cachedRot = QMKReadRotation();
+            cachedScale = QMKReadScale();
             lastRead = now;
         }
-        if (cachedRot != 0 && buffer) {
-            // 方向旋转 (旧项目 canvas 语义翻译): buffer 尺寸/指针不变, CoreGraphics 渲染
-            QMKRotateDirectionInPlace(buffer, cachedRot);
+        if ((cachedRot != 0 || fabs(cachedScale - 1.0f) > 0.01f) && buffer) {
+            // 方向旋转 + 视频缩放 (旧项目 canvas 语义翻译): buffer 尺寸/指针不变, CoreGraphics 渲染
+            QMKRotateDirectionInPlace(buffer, cachedRot, cachedScale);
             static volatile int64_t rotLogSeq = 0;
             int64_t ls = __sync_add_and_fetch(&rotLogSeq, 1);
             if (ls % 60 == 1) {
-                QMKInfo([NSString stringWithFormat:@"方向旋转已应用 (%ld°)", (long)cachedRot]);
+                QMKInfo([NSString stringWithFormat:@"渲染变换已应用 (%ld°, %.2fx)", (long)cachedRot, cachedScale]);
             }
         }
         if (origUpdateCurrentBuffer) origUpdateCurrentBuffer(self, _cmd, buffer);
@@ -689,6 +719,131 @@ static void qmkRotTapped(id self, SEL _cmd, id sender) {
     }
     QMKInfo([NSString stringWithFormat:@"视频旋转 -> %ld°", (long)next]);
 }
+static void qmkScaleTapped(id self, SEL _cmd, id sender) {
+    CGFloat next = QMKCycleScale();
+    UIButton *b = (UIButton *)sender;
+    if (b) {
+        [b setTitle:[NSString stringWithFormat:@"🔍\n缩放 %.2fx", next]
+           forState:UIControlStateNormal];
+    }
+}
+// [取色光标补丁] 点击彩色注入 -> 全屏光标模式: 光标可拖动到指定区域,
+// 再次点击屏幕任意处 = 取光标处颜色并关闭 (问题4 交互).
+// 取色经 UIKit 私有整屏截图 (SpringBoard 进程可用), 不侵入增强模块 (防点击崩溃, 问题3).
+extern UIImage *_UICreateScreenUIImage(void);
+static void QMKEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回调)
+
+// 取色光标 (touchesMoved 拖动, 不用手势 — 免 target 转发)
+@interface QMKPickCursor : UIView @end
+@implementation QMKPickCursor
+- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
+    UITouch *t = touches.anyObject;
+    if (t && t.view == self && self.superview)
+        self.center = [t locationInView:self.superview];
+}
+@end
+// 取色覆盖层 (点击屏幕任意处 = 取色并结束)
+@interface QMKPickOverlay : UIView @end
+@implementation QMKPickOverlay
+- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    QMKEndColorPick(YES);
+}
+@end
+
+static UIWindow *gPickWin = nil;
+static UIView *gPickCursor = nil;
+
+static void QMKEndColorPick(BOOL doPick) {
+    @try {
+        if (doPick && gPickCursor) {
+            CGPoint c = gPickCursor.center;
+            UIWindow *win = gPickWin;
+            CGFloat sw = win ? [UIScreen mainScreen].bounds.size.width : 0;
+            // 光标坐标 (窗口坐标≈屏幕坐标, 全屏 window)
+            UIImage *shot = _UICreateScreenUIImage();
+            if (shot) {
+                CGFloat iw = shot.size.width, ih = shot.size.height;
+                CGFloat sx = sw > 0 ? iw / sw : 1.0;   // 截图像素/点 比例
+                CGFloat px = c.x * sx, py = c.y * sx;
+                CGImageRef cg = shot.CGImage;
+                if (cg && px >= 0 && py >= 0 && px < iw && py < ih) {
+                    unsigned char pix[4] = {0, 0, 0, 0};
+                    CGContextRef bc = CGBitmapContextCreate(pix, 1, 1, 8, 4, CGColorSpaceCreateDeviceRGB(),
+                        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+                    CGContextDrawImage(bc, CGRectMake(-px + 0.5 * sx, ih - py - 0.5 * sx, 1, 1), cg);
+                    CGContextRelease(bc);
+                    UIColor *col = [UIColor colorWithRed:pix[0] / 255.0 green:pix[1] / 255.0 blue:pix[2] / 255.0 alpha:1];
+                    // 写入增强模块共享设置 (启用映射 + 取色值); 同时探测其设置键名供日志对齐
+                    Class enh = NSClassFromString(@"QMEnhancerView");
+                    NSMutableDictionary *s = [NSMutableDictionary dictionary];
+                    if ([enh respondsToSelector:@selector(sharedSettings)]) {
+                        NSDictionary *cur = QMKSafeCall(enh, @selector(sharedSettings), nil);
+                        [s addEntriesFromDictionary:cur ?: @{}];
+                    }
+                    s[@"colorMappingEnabled"] = @YES;
+                    NSArray *cand = @[@"colorPickColor", @"pickedColor", @"mappingColor",
+                                      @"colorPickRGB", @"pickColor"];
+                    for (NSString *k in cand) s[k] = col;
+                    if ([enh respondsToSelector:@selector(saveSharedSettings:)])
+                        QMKSafeCall(enh, @selector(saveSharedSettings:), s);
+                    NSMutableArray *keys = [NSMutableArray array];
+                    for (NSString *k in s) [keys addObject:k];
+                    QMKInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) 写入键:%@",
+                             pix[0], pix[1], pix[2], [keys componentsJoinedByString:@","]]);
+                }
+            }
+        }
+    } @catch (NSException *e) { QMKErr(@"color-pick", e); }
+    @try {
+        [gPickWin setHidden:YES];
+        [gPickWin removeFromSuperview];
+        gPickWin = nil;
+        gPickCursor = nil;
+    } @catch (NSException *e) {}
+}
+
+static void QMKStartColorPick(void) {
+    if (gPickWin && !gPickWin.hidden) { QMKEndColorPick(NO); return; }  // 再点彩色键=切换关闭
+    @try {
+        UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        win.windowLevel = 10000000.0;
+        win.backgroundColor = [UIColor clearColor];
+        win.userInteractionEnabled = YES;
+        // 触摸层: 点击屏幕任意处 = 取色并结束 (光标在其上层, 拖动不误触)
+        QMKPickOverlay *ov = [[QMKPickOverlay alloc] initWithFrame:win.bounds];
+        ov.backgroundColor = [UIColor clearColor];
+        ov.userInteractionEnabled = YES;
+        [win addSubview:ov];
+
+        // 半透明提示条
+        UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 60, win.bounds.size.width, 24)];
+        tip.text = @"拖动光标至目标区域 · 点击屏幕取色并结束";
+        tip.font = [UIFont boldSystemFontOfSize:12];
+        tip.textColor = [UIColor whiteColor];
+        tip.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+        tip.textAlignment = NSTextAlignmentCenter;
+        tip.layer.cornerRadius = 6;
+        tip.clipsToBounds = YES;
+        [win addSubview:tip];
+
+        // 可拖动十字光标 (QMKPickCursor: touchesMoved 自由拖动)
+        QMKPickCursor *cur = [[QMKPickCursor alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
+        cur.center = CGPointMake(win.bounds.size.width / 2, win.bounds.size.height / 2);
+        cur.backgroundColor = [UIColor colorWithWhite:0 alpha:0.15];
+        cur.layer.cornerRadius = 22;
+        cur.layer.borderWidth = 2.5;
+        cur.layer.borderColor = [UIColor colorWithRed:1 green:0.3 blue:0.3 alpha:0.95].CGColor;
+        cur.layer.shadowColor = [UIColor blackColor].CGColor;
+        cur.layer.shadowOpacity = 0.8;
+        cur.layer.shadowRadius = 4;
+        cur.userInteractionEnabled = YES;
+        [win addSubview:cur];
+        gPickCursor = cur;
+        gPickWin = win;
+        [win makeKeyAndVisible];
+        QMKInfo(@"取色模式: 已开启 (拖动光标, 点击屏幕取色)");
+    } @catch (NSException *e) { QMKErr(@"color-start", e); }
+}
 static void qmkColorTapped(id self, SEL _cmd, id sender) {
     @try {
         Class enh = NSClassFromString(@"QMEnhancerView");
@@ -709,17 +864,10 @@ static void qmkColorTapped(id self, SEL _cmd, id sender) {
                 QMKInfo(@"彩色注入: 已关闭");
             }
         } else {
-            // 未启用 → 展开增强面板并进入屏幕取色
-            id inst = QMKSafeCall(enh, @selector(sharedInstance), nil);
-            if (inst) {
-                if ([inst respondsToSelector:@selector(togglePanel)]) {
-                    QMKSafeCall(inst, @selector(togglePanel), nil);
-                }
-                if ([inst respondsToSelector:@selector(enterColorPickMode)]) {
-                    QMKSafeCall(inst, @selector(enterColorPickMode), nil);
-                }
-                QMKInfo(@"彩色注入: 进入屏幕取色 (增强面板已展开)");
-            }
+            // [问题3/4 补丁] 未启用 → 我方光标取色模式 (不再调用增强模块
+            // togglePanel/enterColorPickMode — 该路径点击即崩溃);
+            // 交互: 拖动光标到目标区域, 再次点击屏幕取色并关闭
+            QMKStartColorPick();
         }
     } @catch (NSException *e) { QMKErr(@"color-inject", e); }
 }
@@ -763,7 +911,7 @@ static void QMKBuildPanel(UIViewController *vc) {
     [beam.layer addAnimation:bp forKey:@"qmkBeam"];
 
     // --- 左主控舱 (2x2 原图标键 + 旋转/彩色 + 迷你RTMP) ---
-    UIView *podL = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 88 * K, 168 * K, 330 * K)];
+    UIView *podL = [[UIView alloc] initWithFrame:CGRectMake(12 * K, 88 * K, 168 * K, 376 * K)];
     podL.layer.cornerRadius = 22 * K;
     podL.layer.borderWidth = 1.5;
     podL.layer.borderColor = QMKColorGreen().CGColor;
@@ -836,15 +984,34 @@ static void QMKBuildPanel(UIViewController *vc) {
         if (b.tag == QMK_TAG_ROT) QMKController().rotBtn = b;
     }
 
+    // 视频缩放键 (第三行全宽): 渲染层等比缩放循环 1.0/1.5/2.0/0.8
+    {
+        UIButton *sb = [QMKPressButton buttonWithType:UIButtonTypeCustom];
+        sb.frame = CGRectMake(14 * K, 272 * K, bw * 2 + 10 * K, 40 * K);
+        sb.tag = QMK_TAG_SCL;
+        sb.layer.cornerRadius = 12 * K;
+        sb.backgroundColor = [UIColor colorWithRed:0.98 green:0.75 blue:0.28 alpha:1.0];
+        sb.layer.borderWidth = 1.5;
+        sb.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+        [sb setTitle:[NSString stringWithFormat:@"🔍\n缩放 %.2fx", (double)QMKReadScale()]
+            forState:UIControlStateNormal];
+        sb.titleLabel.font = [UIFont boldSystemFontOfSize:10 * K];
+        sb.titleLabel.numberOfLines = 1;
+        sb.titleLabel.textAlignment = NSTextAlignmentCenter;
+        [sb setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [sb addTarget:vc action:@selector(qmkScaleTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [podL addSubview:sb];
+    }
+
     // 迷你 RTMP: 开关 + 输入 (镜像到原控件后走原方法)
-    UISwitch *miniSw = [[UISwitch alloc] initWithFrame:CGRectMake(14 * K, 276 * K, 51 * K, 31 * K)];
+    UISwitch *miniSw = [[UISwitch alloc] initWithFrame:CGRectMake(14 * K, 322 * K, 51 * K, 31 * K)];
     miniSw.tag = VP_TAG_MINISW;
     miniSw.onTintColor = QMKColorGreen();
     miniSw.transform = CGAffineTransformMakeScale(K, K);
     [miniSw addTarget:vc action:@selector(vpMiniSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [podL addSubview:miniSw];
 
-    UITextField *miniTf = [[UITextField alloc] initWithFrame:CGRectMake(72 * K, 280 * K, 84 * K, 22 * K)];
+    UITextField *miniTf = [[UITextField alloc] initWithFrame:CGRectMake(72 * K, 326 * K, 84 * K, 22 * K)];
     miniTf.tag = VP_TAG_MINITF;
     miniTf.font = [UIFont systemFontOfSize:8 * K];
     miniTf.textColor = [UIColor colorWithRed:0.81 green:0.88 blue:1 alpha:1];
@@ -1039,8 +1206,9 @@ static void QMKInstallPanelHooks(void) {
         class_addMethod(settings, @selector(vpMiniSwitchChanged:), (IMP)qmkMiniSwitchChanged, "v@:@");
         class_addMethod(settings, @selector(vpMiniTfEnd:), (IMP)qmkMiniTfEnd, "v@:@");
         class_addMethod(settings, @selector(vpRtmpSwitchChanged:), (IMP)qmkRtmpSwitchChanged, "v@:@");
-        class_addMethod(settings, @selector(qmkRotTapped:), (IMP)qmkRotTapped, "v@:@");
-        class_addMethod(settings, @selector(qmkColorTapped:), (IMP)qmkColorTapped, "v@:@");
+class_addMethod(settings, @selector(qmkRotTapped:), (IMP)qmkRotTapped, "v@:@");
+class_addMethod(settings, @selector(qmkScaleTapped:), (IMP)qmkScaleTapped, "v@:@");
+class_addMethod(settings, @selector(qmkColorTapped:), (IMP)qmkColorTapped, "v@:@");
         class_addMethod(settings, @selector(qmkLogTapped:), (IMP)qmkLogTapped, "v@:@");
         QMKPanelHooked = YES;
         QMKInfo(@"面板接管: viewDidLoad 已挂载 (整面重建 + 旧实例销毁)");
