@@ -249,18 +249,20 @@ static void QMKRotateDirectionInPlace(CVBufferRef buf, NSInteger rot) {
                 // 对齐 JS canvas 坐标系 (原点左上, y 向下): 翻转 y
                 CGContextTranslateCTM(ctx, 0, hh);
                 CGContextScaleCTM(ctx, 1, -1);
-                // JS: ctx.translate(cw/2,ch/2); ctx.rotate(rad)  [翻转系下正角=顺时针, 与 JS 一致]
+                // JS: ctx.translate(cw/2,ch/2); ctx.rotate(rad)
+                // CG 权威行为: drawImage 将图像数学正立放置 (第0行在 rect 高 y 端),
+                // 故 -rad 才等价于 JS canvas 的顺时针 (+90° 人头朝右), 已逐点仿真验证:
+                // -rad => 0°上 -> 90°右 -> 180°倒立 -> 270°左
                 CGContextTranslateCTM(ctx, ww / 2.0, hh / 2.0);
                 NSInteger rr = ((rot % 360) + 360) % 360;
-                if (rr) CGContextRotateCTM(ctx, (CGFloat)rr * (CGFloat)M_PI / 180.0f);
-                // JS 默认分支 (非 exact): aspectFill s=max — 画面填满有效区, 比例观感
-                // 与正常视频/真实摄像头一致 ("mimics real camera fill behavior"),
-                // 裁掉溢出部分 (clip 到有效区)
+                if (rr) CGContextRotateCTM(ctx, -(CGFloat)rr * (CGFloat)M_PI / 180.0f);
+                // JS exact 分支对齐 (人脸识别场景): aspectFit s=min — 完整面目及景象,
+                // 不裁剪任何内容 (裁剪过大过多会导致无法识别人脸);
+                // rotate(+rad)=顺时针 上->右->下->左, 已按 CG 真实行为逐点仿真验证
                 CGFloat ew = (rr == 90 || rr == 270) ? hh : ww;
                 CGFloat eh = (rr == 90 || rr == 270) ? ww : hh;
-                CGContextClipToRect(ctx, CGRectMake(-ew / 2.0, -eh / 2.0, ew, eh));
                 CGFloat vw = ww, vh = hh;
-                CGFloat s = MAX(ew / vw, eh / vh);
+                CGFloat s = MIN(ew / vw, eh / vh);
                 CGFloat dw = vw * s, dh = vh * s;
                 CGContextDrawImage(ctx, CGRectMake(-dw / 2.0, -dh / 2.0, dw, dh), img);
                 CGContextFlush(ctx);
