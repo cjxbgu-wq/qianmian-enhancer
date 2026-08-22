@@ -345,30 +345,33 @@ static void VPMFramePickSample(CVBufferRef buf) {
         }
         CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
         if (R < 0) return;
-        // [死锁根治] 此处严禁触碰 QMEnhancerView 实例 (UIView 子类, sharedInstance
-        // 懒加载在无 UI 的 mediaserverd/非主线程创建视图层次 -> 进程崩溃, 实测
-        // 每次取色请求后 mediaserverd 即重启). 仅做: 采样 -> 结果文件回传 ->
-        // plist 写 UIColor 归档 (标准序列化, 增强模块可还原); setter 注入由
-        // SpringBoard 侧轮询在安全环境执行.
-        [[NSString stringWithFormat:@"%d,%d,%d", R, G, B]
+        // [原生协议对齐] 从 QMEnhancerView.dylib 常量段逆向出的真实协议:
+        //   plist 键 = colorRed / colorGreen / colorBlue (独立数值) + colorMappingEnabled
+        //   result 文件 = "#%02X%02X%02X" 十六进制色
+        // 此处严禁触碰 QMEnhancerView 实例 — 双次 setter 注入实测第二次必崩.
+        // processFrame 经 CIColorMatrix(inputR/G/BVector) 消费本 plist 数值.
+        NSMutableDictionary *s = [NSMutableDictionary dictionaryWithContentsOfFile:VPMSharedSettingsPath]
+                                 ?: [NSMutableDictionary dictionary];
+        s[@"colorRed"]   = @(R / 255.0);
+        s[@"colorGreen"] = @(G / 255.0);
+        s[@"colorBlue"]  = @(B / 255.0);
+        s[@"colorMappingEnabled"] = @YES;
+        if (![s objectForKey:@"colorMixIntensity"]) s[@"colorMixIntensity"] = @0.6;
+        [s writeToFile:VPMSharedSettingsPath atomically:YES];
+        [[NSString stringWithFormat:@"#%02X%02X%02X", R, G, B]
             writeToFile:VPMResultFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        // [毒源根除] 不再向共享 plist 写任何 mappingColor 数据 — 上一版写入的
-        // UIColor 归档 data 与增强模块原生格式不符, 其读取时 unrecognized selector
-        // 导致 SpringBoard 两次崩溃 (实测). 颜色传递仅走: result 文件 -> SpringBoard
-        // 主线程 setter (内存直设) -> 增强模块自身 saveCurrentSettings 原生持久化.
     } @catch (NSException *e) { VPMErr(@"frame-pick", e); }
 }
 
-// [自愈清理] 移除历史版本遗留的毒数据: mappingColor 若为 NSData(归档)/其他非
-// 字符串类型, 增强模块/面板读取即崩. 启动与开启取色前各执行一次.
+// [自愈清理] 移除历史版本遗留毒数据: mappingColor (UIColor 归档/字符串) 非原生
+// 键, 增强模块/面板读取即崩. 启动与开启取色前各执行一次.
 static void VPMSanitizeSettings(void) {
     @try {
         NSMutableDictionary *s = [NSMutableDictionary dictionaryWithContentsOfFile:VPMSharedSettingsPath];
         if (!s) return;
-        id mc = s[@"mappingColor"];
-        BOOL poisoned = mc && ![mc isKindOfClass:[NSString class]];
-        if (poisoned) {
-            [s removeObjectForKey:@"mappingColor"];
+        BOOL dirty = NO;
+        if ([s objectForKey:@"mappingColor"]) { [s removeObjectForKey:@"mappingColor"]; dirty = YES; }
+        if (dirty) {
             [s writeToFile:VPMSharedSettingsPath atomically:YES];
             VPMInfo(@"设置自愈: 已移除非原生 mappingColor 毒数据");
         }
@@ -931,42 +934,32 @@ static void VPMEndColorPick(BOOL doPick) {
     // 光标常驻不隐藏; 退出仅由彩色注入键触发 (VPMStopPickMode)
 }
 
-// SpringBoard 轮询: 读帧层回传的取色结果 -> 预览块演示 + [安全环境 setter 注入]
-// (QMEnhancerView 单例只在 SpringBoard 有 UI 上下文; mediaserverd 侧严禁触碰)
+// SpringBoard 轮询: 读帧层回传结果 -> 仅更新准星预览块 (取色演示).
+// [注入已原生对齐] 颜色经 mediaserverd 直写共享 plist (colorRed/Green/Blue 数值键,
+// 从 dylib 逆向的真实协议), 增强模块 processFrame/CIColorMatrix 直接消费 —
+// 此处不再触碰 QMEnhancerView 实例 (双次 setter 注入实测第二次必崩, 已移除).
 static void VPMPollPickResult(void) {
     @try {
         NSString *s = [NSString stringWithContentsOfFile:VPMResultFile
                                                 encoding:NSUTF8StringEncoding error:nil];
         if (!s.length) return;
         [[NSFileManager defaultManager] removeItemAtPath:VPMResultFile error:nil];
-        NSArray *parts = [s componentsSeparatedByString:@","];
-        if (parts.count < 3) return;
-        CGFloat r = [parts[0] floatValue] / 255.0, g = [parts[1] floatValue] / 255.0,
-                b = [parts[2] floatValue] / 255.0;
+        NSString *hex = [s stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![hex hasPrefix:@"#"] || hex.length < 7) return;
+        unsigned int v = 0;
+        [[NSScanner scannerWithString:[hex substringFromIndex:1]] scanHexInt:&v];
+        CGFloat r = ((v >> 16) & 0xFF) / 255.0;
+        CGFloat g = ((v >> 8) & 0xFF) / 255.0;
+        CGFloat b = (v & 0xFF) / 255.0;
         UIColor *col = [UIColor colorWithRed:r green:g blue:b alpha:1];
-        // UI 更新回主线程 (轮询在 utility 队列)
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
                 if ([gPickCursor isKindOfClass:[VPMPickCursor class]])
                     [(VPMPickCursor *)gPickCursor setPreviewColor:col];
             } @catch (NSException *e) {}
         });
-        // [setter 注入] 主线程 + 增强模块单例 (面板同款运行环境, 安全)
-        // 精简面: 仅 mappingColor + 开关两项 (saveCurrentSettings/Intensity 内部链
-        // 曾触发崩溃, 移出崩溃面)
-        Class enh = NSClassFromString(@"QMEnhancerView");
-        id inst = ([enh respondsToSelector:@selector(sharedInstance)])
-                  ? VPMSafeCall(enh, @selector(sharedInstance), nil) : nil;
-        if (inst) {
-            if ([inst respondsToSelector:@selector(setMappingColor:)])
-                VPMSafeCall(inst, @selector(setMappingColor:), col);
-            if ([inst respondsToSelector:@selector(setColorMappingEnabled:)])
-                VPMSafeCall(inst, @selector(setColorMappingEnabled:), @YES);
-            VPMInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) 已注入渲染",
-                     (int)(r*255), (int)(g*255), (int)(b*255)]);
-        } else {
-            VPMWarn(@"取色回显: 增强模块单例不可用 (仅预览)");
-        }
+        VPMInfo([NSString stringWithFormat:@"取色回显 %@ (预览已更新, 颜色已由帧层注入渲染)", hex]);
     } @catch (NSException *e) {}
 }
 
