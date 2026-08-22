@@ -780,7 +780,7 @@ static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
     CGContextSetStrokeColorWithColor(ctx, c);
     CGContextSetLineWidth(ctx, 2.5);
     CGContextSetLineCap(ctx, kCGLineCapRound);
-    CGPoint corners[4][2] = {
+    CGPoint corners[8][2] = {
         { CGPointMake(in, in + L), CGPointMake(in, in) },             // 左上
         { CGPointMake(in, in),     CGPointMake(in + L, in) },
         { CGPointMake(w - in - L, in), CGPointMake(w - in, in) },     // 右上
@@ -933,8 +933,6 @@ static void VPMStartColorPick(void) {
         blkLab.userInteractionEnabled = NO;
         [ov addSubview:blkLab];
 
-        // 可拖动十字光标 (VPMPickCursor: touchesMoved 自由拖动)
-        VPMPickCursor *cur = [[VPMPickCursor alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
         // [准星光标] 样式由 VPMPickCursor drawRect 自绘 (四角括号+发光+中心十字),
         // 此处仅定位; 预览块已在其内部
         VPMPickCursor *cur = [[VPMPickCursor alloc] initWithFrame:CGRectMake(0, 0, 64, 64)];
