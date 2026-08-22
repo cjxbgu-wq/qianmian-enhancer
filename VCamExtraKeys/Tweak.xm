@@ -730,7 +730,7 @@ static void qmkScaleTapped(id self, SEL _cmd, id sender) {
 // [取色光标补丁] 点击彩色注入 -> 全屏光标模式: 光标可拖动到指定区域,
 // 再次点击屏幕任意处 = 取光标处颜色并关闭 (问题4 交互).
 // 取色经 UIKit 私有整屏截图 (SpringBoard 进程可用), 不侵入增强模块 (防点击崩溃, 问题3).
-extern UIImage *_UICreateScreenUIImage(void);
+extern "C" UIImage *_UICreateScreenUIImage(void);
 static void QMKEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回调)
 
 // 取色光标 (touchesMoved 拖动, 不用手势 — 免 target 转发)
