@@ -39,6 +39,8 @@ static NSString *const VPMErrorLogPath       = @"/tmp/vcampro_max.log";
 static NSString *const VPMRotationKey        = @"videoRotationLV";
 static NSString *const VPMLegacyRotationKey  = @"videoRotation";
 static NSString *const VPMScaleKey           = @"videoScaleLV";
+static NSString *const VPMPointFile          = @"/tmp/vpm_pick_point.txt";
+static NSString *const VPMResultFile         = @"/tmp/vpm_pick_color.txt";
 
 static const NSInteger VPM_TAG_ROT  = 0x6E31;
 static const NSInteger VPM_TAG_LOG  = 0x6E33;
@@ -316,6 +318,59 @@ static void VPMRotateDirectionInPlace(CVBufferRef buf, NSInteger rot, CGFloat sc
     }
 }
 
+// [帧层取色采样] 消费 SpringBoard 发来的坐标请求: 从真实视频帧读像素 ->
+// 同进程直设 QMEnhancerView setter (UIColor 内存传递, 零序列化) + 持久化兜底 ->
+// 写结果文件供准星预览回显. 全程无私有 API, 无截屏 (旧方案在 SpringBoard abort).
+static void VPMFramePickSample(CVBufferRef buf) {
+    @try {
+        NSString *pt = [NSString stringWithContentsOfFile:VPMPointFile
+                                                 encoding:NSUTF8StringEncoding error:nil];
+        if (!pt.length) return;
+        [NSFileManager defaultManager removeItemAtPath:VPMPointFile error:nil];
+        NSArray *parts = [pt componentsSeparatedByString:@","];
+        if (parts.count < 2) return;
+        double fx = [parts[0] doubleValue], fy = [parts[1] doubleValue];
+        if (fx < 0) fx = 0; if (fx > 1) fx = 1;
+        if (fy < 0) fy = 0; if (fy > 1) fy = 1;
+        CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+        size_t w = CVPixelBufferGetWidth(buf), h = CVPixelBufferGetHeight(buf);
+        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(buf);
+        size_t bpr = CVPixelBufferGetBytesPerRow(buf);
+        int R = -1, G = -1, B = -1;
+        if (base && w && h && bpr >= w * 4) {
+            long px = (long)(fx * (w - 1));
+            long py = (long)(fy * (h - 1));
+            const uint8_t *p = base + py * bpr + px * 4;   // BGRA
+            B = p[0]; G = p[1]; R = p[2];
+        }
+        CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+        if (R < 0) return;
+        UIColor *col = [UIColor colorWithRed:R / 255.0 green:G / 255.0 blue:B / 255.0 alpha:1];
+        Class enh = NSClassFromString(@"QMEnhancerView");
+        id inst = ([enh respondsToSelector:@selector(sharedInstance)])
+                  ? VPMSafeCall(enh, @selector(sharedInstance), nil) : nil;
+        if (inst) {
+            if ([inst respondsToSelector:@selector(setMappingColor:)])
+                VPMSafeCall(inst, @selector(setMappingColor:), col);
+            if ([inst respondsToSelector:@selector(setColorMixIntensity:)])
+                VPMSafeCall(inst, @selector(setColorMixIntensity:), @0.6);
+            if ([inst respondsToSelector:@selector(setColorMappingEnabled:)])
+                VPMSafeCall(inst, @selector(setColorMappingEnabled:), @YES);
+            if ([inst respondsToSelector:@selector(saveCurrentSettings)])
+                VPMSafeCall(inst, @selector(saveCurrentSettings), nil);
+        }
+        // 持久化兜底 (数值字符串, 规避 UIColor plist 序列化限制)
+        NSMutableDictionary *s = [NSMutableDictionary dictionaryWithContentsOfFile:VPMSharedSettingsPath]
+                                 ?: [NSMutableDictionary dictionary];
+        s[@"mappingColor"] = [NSString stringWithFormat:@"%.4f,%.4f,%.4f", R / 255.0, G / 255.0, B / 255.0];
+        s[@"colorMappingEnabled"] = @YES;
+        [s writeToFile:VPMSharedSettingsPath atomically:YES];
+        // 回传结果给准星预览
+        [[NSString stringWithFormat:@"%d,%d,%d", R, G, B]
+            writeToFile:VPMResultFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (NSException *e) { VPMErr(@"frame-pick", e); }
+}
+
 static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
     @try {
         __sync_add_and_fetch(&VPMFramesUpdate, 1);
@@ -337,6 +392,8 @@ static void VPMUpdateCurrentBufferHook(id self, SEL _cmd, CVBufferRef buffer) {
             cachedScale = VPMReadScale();
             lastRead = now;
         }
+        // 帧层取色采样 (有请求文件时执行; 每帧轻量 existence check)
+        if (buffer) VPMFramePickSample(buffer);
         if ((cachedRot != 0 || fabs(cachedScale - 1.0f) > 0.01f) && buffer) {
             // 方向旋转 + 视频缩放 (旧项目 canvas 语义翻译): buffer 尺寸/指针不变, CoreGraphics 渲染
             VPMRotateDirectionInPlace(buffer, cachedRot, cachedScale);
@@ -740,7 +797,6 @@ static void vpmScaleTapped(id self, SEL _cmd, id sender) {
 // [取色光标补丁] 点击彩色注入 -> 全屏光标模式: 光标可拖动到指定区域,
 // 再次点击屏幕任意处 = 取光标处颜色并关闭 (问题4 交互).
 // 取色经 UIKit 私有整屏截图 (SpringBoard 进程可用), 不侵入增强模块 (防点击崩溃, 问题3).
-extern "C" UIImage *_UICreateScreenUIImage(void);
 static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回调)
 
 // [准星光标] 人脸识别对焦框样式: 四角 L 括号 + 中心十字 + 白色发光;
@@ -822,61 +878,46 @@ static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
 static UIView *gPickOverlay = nil;   // 挂载于 keyWindow 的取色层 (独立 UIWindow 在
 static UIView *gPickCursor = nil;    // SpringBoard UIScene 架构下不渲染 -> 光标不可见)
 
+// [两段式跨进程取色] SpringBoard 点击 -> 写坐标文件; mediaserverd 帧钩子从
+// 真实视频帧采样该坐标像素 -> 同进程直设 QMEnhancerView setter + 持久化 ->
+// 写结果文件; SpringBoard 轮询回显预览. 零私有 API (旧截屏方案在 SpringBoard
+// abort 导致黑屏崩溃, 已废弃).
+
 static void VPMEndColorPick(BOOL doPick) {
     @try {
-        if (doPick && gPickCursor) {
+        if (doPick && gPickCursor && gPickOverlay) {
+            // 光标中心 -> 屏幕比例坐标 (0..1), 发送给帧层采样
+            CGRect sb = [UIScreen mainScreen].bounds;
             CGPoint c = gPickCursor.center;
-            UIImage *shot = _UICreateScreenUIImage();
-            if (shot) {
-                CGFloat iw = shot.size.width, ih = shot.size.height;
-                CGFloat sw = [UIScreen mainScreen].bounds.size.width;
-                CGFloat sx = sw > 0 ? iw / sw : 1.0;   // 截图像素/点 比例
-                CGFloat px = c.x * sx, py = c.y * sx;
-                CGImageRef cg = shot.CGImage;
-                if (cg && px >= 0 && py >= 0 && px < iw && py < ih) {
-                    unsigned char pix[4] = {0, 0, 0, 0};
-                    CGContextRef bc = CGBitmapContextCreate(pix, 1, 1, 8, 4, CGColorSpaceCreateDeviceRGB(),
-                        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-                    CGContextDrawImage(bc, CGRectMake(-px + 0.5 * sx, ih - py - 0.5 * sx, 1, 1), cg);
-                    CGContextRelease(bc);
-                    UIColor *col = [UIColor colorWithRed:pix[0] / 255.0 green:pix[1] / 255.0 blue:pix[2] / 255.0 alpha:1];
-                    // [键名对齐] 从 QMEnhancerView.dylib 符号提取的真实设置键:
-                    //   mappingColor (取色颜色) + colorMappingEnabled (开关) + colorMixIntensity (强度)
-                    // [注入强化] 双通道写入: ① 实例 setter (内存直设 UIColor, 无 plist 序列化
-                    //   丢失风险) ② saveSharedSettings: 持久化 — 确保帧管线 processFrame 读到
-                    Class enh = NSClassFromString(@"QMEnhancerView");
-                    NSMutableDictionary *s = [NSMutableDictionary dictionary];
-                    if ([enh respondsToSelector:@selector(sharedSettings)]) {
-                        NSDictionary *cur2 = VPMSafeCall(enh, @selector(sharedSettings), nil);
-                        [s addEntriesFromDictionary:cur2 ?: @{}];
-                    }
-                    s[@"mappingColor"] = col;
-                    s[@"colorMappingEnabled"] = @YES;
-                    if (![s objectForKey:@"colorMixIntensity"]) s[@"colorMixIntensity"] = @0.6;
-                    id inst = ([enh respondsToSelector:@selector(sharedInstance)])
-                              ? VPMSafeCall(enh, @selector(sharedInstance), nil) : nil;
-                    if (inst) {
-                        if ([inst respondsToSelector:@selector(setMappingColor:)])
-                            VPMSafeCall(inst, @selector(setMappingColor:), col);
-                        if ([inst respondsToSelector:@selector(setColorMixIntensity:)])
-                            VPMSafeCall(inst, @selector(setColorMixIntensity:), @0.6);
-                        if ([inst respondsToSelector:@selector(setColorMappingEnabled:)])
-                            VPMSafeCall(inst, @selector(setColorMappingEnabled:), @YES);
-                        if ([inst respondsToSelector:@selector(saveCurrentSettings)])
-                            VPMSafeCall(inst, @selector(saveCurrentSettings), nil);
-                    }
-                    if ([enh respondsToSelector:@selector(saveSharedSettings:)])
-                        VPMSafeCall(enh, @selector(saveSharedSettings:), s);
-                    VPMInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) -> mappingColor 已注入",
-                             pix[0], pix[1], pix[2]]);
-                    // [取色演示] 预览块显示最近吸取颜色 (光标常驻, 连续换色测试)
-                    if ([gPickCursor isKindOfClass:[VPMPickCursor class]])
-                        ((VPMPickCursor *)gPickCursor).preview.backgroundColor = col;
-                }
-            }
+            double fx = sb.width > 0 ? c.x / sb.width : 0;
+            double fy = sb.height > 0 ? c.y / sb.height : 0;
+            if (fx < 0) fx = 0; if (fx > 1) fx = 1;
+            if (fy < 0) fy = 0; if (fy > 1) fy = 1;
+            NSString *payload = [NSString stringWithFormat:@"%.6f,%.6f", fx, fy];
+            [payload writeToFile:VPMPointFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            VPMInfo([NSString stringWithFormat:@"取色请求: 坐标(%.3f,%.3f)已发送帧层采样", fx, fy]);
         }
     } @catch (NSException *e) { VPMErr(@"color-pick", e); }
-    // 取色后光标常驻屏幕不隐藏; 退出仅由彩色注入键触发 (VPMStopPickMode)
+    // 光标常驻不隐藏; 退出仅由彩色注入键触发 (VPMStopPickMode)
+}
+
+// SpringBoard 轮询: 读帧层回传的取色结果, 更新准星预览块 (演示)
+static void VPMPollPickResult(void) {
+    @try {
+        NSString *s = [NSString stringWithContentsOfFile:VPMResultFile
+                                                encoding:NSUTF8StringEncoding error:nil];
+        if (!s.length) return;
+        [NSFileManager.defaultManager removeItemAtPath:VPMResultFile error:nil];
+        NSArray *parts = [s componentsSeparatedByString:@","];
+        if (parts.count < 3) return;
+        CGFloat r = [parts[0] floatValue] / 255.0, g = [parts[1] floatValue] / 255.0,
+                b = [parts[2] floatValue] / 255.0;
+        UIColor *col = [UIColor colorWithRed:r green:g blue:b alpha:1];
+        if ([gPickCursor isKindOfClass:[VPMPickCursor class]])
+            ((VPMPickCursor *)gPickCursor).preview.backgroundColor = col;
+        VPMInfo([NSString stringWithFormat:@"取色回显 RGB(%d,%d,%d) (预览已更新)",
+                 (int)(r*255), (int)(g*255), (int)(b*255)]);
+    } @catch (NSException *e) {}
 }
 
 // 停止取色模式: 光标/覆盖层移除消失
@@ -903,7 +944,7 @@ static void VPMStartColorPick(void) {
 
         // 半透明提示条
         UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 60, kw.bounds.size.width, 24)];
-        tip.text = @"拖动准星取色 · 点击屏幕=吸取注入 · 彩色键=结束";
+        tip.text = @"拖动准星至目标 · 点击屏幕=吸取视频颜色注入 · 彩色键=结束";
         tip.font = [UIFont boldSystemFontOfSize:12];
         tip.textColor = [UIColor whiteColor];
         tip.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
@@ -912,26 +953,6 @@ static void VPMStartColorPick(void) {
         tip.clipsToBounds = YES;
         tip.userInteractionEnabled = NO;
         [ov addSubview:tip];
-
-        // [模拟测试色块] 标准纯色块 (红/绿/蓝): 光标拖到色块上点击必吸精确 RGB,
-        // 用于验证取色->mappingColor 注入->视频颜色波动 渲染链路
-        NSArray *blocks = @[[UIColor colorWithRed:1 green:0 blue:0 alpha:1],
-                            [UIColor colorWithRed:0 green:1 blue:0 alpha:1],
-                            [UIColor colorWithRed:0 green:0 blue:1 alpha:1]];
-        for (int i = 0; i < 3; i++) {
-            UIView *blk = [[UIView alloc] initWithFrame:CGRectMake(16 + i * 56, 96, 48, 48)];
-            blk.backgroundColor = blocks[i];
-            blk.layer.borderWidth = 1;
-            blk.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.6].CGColor;
-            blk.userInteractionEnabled = NO;   // 不拦截触摸, 点击穿透到 overlay=正常取色
-            [ov addSubview:blk];
-        }
-        UILabel *blkLab = [[UILabel alloc] initWithFrame:CGRectMake(16, 148, 168, 14)];
-        blkLab.text = @"↑ 标准色块 (测试取色用)";
-        blkLab.font = [UIFont systemFontOfSize:9];
-        blkLab.textColor = [UIColor colorWithWhite:1 alpha:0.7];
-        blkLab.userInteractionEnabled = NO;
-        [ov addSubview:blkLab];
 
         // [准星光标] 样式由 VPMPickCursor drawRect 自绘 (四角括号+发光+中心十字),
         // 此处仅定位; 预览块已在其内部
@@ -942,6 +963,16 @@ static void VPMStartColorPick(void) {
         gPickCursor = cur;
         gPickOverlay = ov;
         [kw addSubview:ov];
+        // 结果轮询 (1s): 帧层回传取色 -> 预览演示 (取色模式关闭时自毁)
+        dispatch_source_t poll = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(poll, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                  1.0 * NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(poll, ^{ @autoreleasepool {
+            if (!gPickOverlay) { dispatch_source_cancel(poll); return; }
+            VPMPollPickResult();
+        }});
+        dispatch_resume(poll);
         VPMInfo(@"取色模式: 已开启 (准星拖动取色 · 点击屏幕=吸取注入 · 彩色键=结束)");
     } @catch (NSException *e) { VPMErr(@"color-start", e); }
 }
