@@ -253,12 +253,14 @@ static void QMKRotateDirectionInPlace(CVBufferRef buf, NSInteger rot) {
                 CGContextTranslateCTM(ctx, ww / 2.0, hh / 2.0);
                 NSInteger rr = ((rot % 360) + 360) % 360;
                 if (rr) CGContextRotateCTM(ctx, (CGFloat)rr * (CGFloat)M_PI / 180.0f);
-                // JS: ew=(rr==90||270)?ch:cw, eh=?cw:ch
+                // JS 默认分支 (非 exact): aspectFill s=max — 画面填满有效区, 比例观感
+                // 与正常视频/真实摄像头一致 ("mimics real camera fill behavior"),
+                // 裁掉溢出部分 (clip 到有效区)
                 CGFloat ew = (rr == 90 || rr == 270) ? hh : ww;
                 CGFloat eh = (rr == 90 || rr == 270) ? ww : hh;
-                // JS exact 分支: s=min(ew/vw,eh/vh) aspectFit 完整显示 (正常规格, 不放大不裁剪)
+                CGContextClipToRect(ctx, CGRectMake(-ew / 2.0, -eh / 2.0, ew, eh));
                 CGFloat vw = ww, vh = hh;
-                CGFloat s = MIN(ew / vw, eh / vh);
+                CGFloat s = MAX(ew / vw, eh / vh);
                 CGFloat dw = vw * s, dh = vh * s;
                 CGContextDrawImage(ctx, CGRectMake(-dw / 2.0, -dh / 2.0, dw, dh), img);
                 CGContextFlush(ctx);
