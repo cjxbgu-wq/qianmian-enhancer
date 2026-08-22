@@ -845,7 +845,7 @@ static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
             [UIColor colorWithRed:0.35 green:1 blue:0.65 alpha:0.10 * (4 - i)].CGColor);
         CGContextSetLineWidth(ctx, 2.5 + i * 1.6);
         CGContextBeginPath(ctx);
-        CGContextAddArc(ctx, cx, cy, ringR, 0, M_PI * 2);
+        CGContextAddEllipseInRect(ctx, CGRectMake(cx - ringR, cy - ringR, ringR * 2, ringR * 2));
         CGContextStrokePath(ctx);
     }
     // 主圆环
@@ -853,7 +853,7 @@ static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
     CGContextSetLineWidth(ctx, 2.5);
     CGContextSetLineCap(ctx, kCGLineCapRound);
     CGContextBeginPath(ctx);
-    CGContextAddArc(ctx, cx, cy, ringR, 0, M_PI * 2);
+    CGContextAddEllipseInRect(ctx, CGRectMake(cx - ringR, cy - ringR, ringR * 2, ringR * 2));
     CGContextStrokePath(ctx);
     // 四方向十字线: 从视图边缘指向圆环 (留出与环之间空隙)
     CGContextSetLineWidth(ctx, 2.0);
