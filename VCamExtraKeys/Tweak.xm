@@ -750,19 +750,17 @@ static void QMKEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
 }
 @end
 
-static UIWindow *gPickWin = nil;
-static UIView *gPickCursor = nil;
+static UIView *gPickOverlay = nil;   // 挂载于 keyWindow 的取色层 (独立 UIWindow 在
+static UIView *gPickCursor = nil;    // SpringBoard UIScene 架构下不渲染 -> 光标不可见)
 
 static void QMKEndColorPick(BOOL doPick) {
     @try {
         if (doPick && gPickCursor) {
             CGPoint c = gPickCursor.center;
-            UIWindow *win = gPickWin;
-            CGFloat sw = win ? [UIScreen mainScreen].bounds.size.width : 0;
-            // 光标坐标 (窗口坐标≈屏幕坐标, 全屏 window)
             UIImage *shot = _UICreateScreenUIImage();
             if (shot) {
                 CGFloat iw = shot.size.width, ih = shot.size.height;
+                CGFloat sw = [UIScreen mainScreen].bounds.size.width;
                 CGFloat sx = sw > 0 ? iw / sw : 1.0;   // 截图像素/点 比例
                 CGFloat px = c.x * sx, py = c.y * sx;
                 CGImageRef cg = shot.CGImage;
@@ -773,50 +771,45 @@ static void QMKEndColorPick(BOOL doPick) {
                     CGContextDrawImage(bc, CGRectMake(-px + 0.5 * sx, ih - py - 0.5 * sx, 1, 1), cg);
                     CGContextRelease(bc);
                     UIColor *col = [UIColor colorWithRed:pix[0] / 255.0 green:pix[1] / 255.0 blue:pix[2] / 255.0 alpha:1];
-                    // 写入增强模块共享设置 (启用映射 + 取色值); 同时探测其设置键名供日志对齐
+                    // [键名对齐] 从 QMEnhancerView.dylib 符号提取的真实设置键:
+                    //   mappingColor (取色颜色) + colorMappingEnabled (开关) + colorMixIntensity (强度)
                     Class enh = NSClassFromString(@"QMEnhancerView");
                     NSMutableDictionary *s = [NSMutableDictionary dictionary];
                     if ([enh respondsToSelector:@selector(sharedSettings)]) {
-                        NSDictionary *cur = QMKSafeCall(enh, @selector(sharedSettings), nil);
-                        [s addEntriesFromDictionary:cur ?: @{}];
+                        NSDictionary *cur2 = QMKSafeCall(enh, @selector(sharedSettings), nil);
+                        [s addEntriesFromDictionary:cur2 ?: @{}];
                     }
+                    s[@"mappingColor"] = col;
                     s[@"colorMappingEnabled"] = @YES;
-                    NSArray *cand = @[@"colorPickColor", @"pickedColor", @"mappingColor",
-                                      @"colorPickRGB", @"pickColor"];
-                    for (NSString *k in cand) s[k] = col;
                     if ([enh respondsToSelector:@selector(saveSharedSettings:)])
                         QMKSafeCall(enh, @selector(saveSharedSettings:), s);
-                    NSMutableArray *keys = [NSMutableArray array];
-                    for (NSString *k in s) [keys addObject:k];
-                    QMKInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) 写入键:%@",
-                             pix[0], pix[1], pix[2], [keys componentsJoinedByString:@","]]);
+                    QMKInfo([NSString stringWithFormat:@"取色完成 RGB(%d,%d,%d) -> mappingColor 已注入",
+                             pix[0], pix[1], pix[2]]);
                 }
             }
         }
     } @catch (NSException *e) { QMKErr(@"color-pick", e); }
     @try {
-        [gPickWin setHidden:YES];
-        [gPickWin removeFromSuperview];
-        gPickWin = nil;
+        [gPickOverlay removeFromSuperview];
+        gPickOverlay = nil;
         gPickCursor = nil;
     } @catch (NSException *e) {}
 }
 
 static void QMKStartColorPick(void) {
-    if (gPickWin && !gPickWin.hidden) { QMKEndColorPick(NO); return; }  // 再点彩色键=切换关闭
+    if (gPickOverlay.superview) { QMKEndColorPick(NO); return; }  // 再点彩色键=切换关闭
     @try {
-        UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        win.windowLevel = 10000000.0;
-        win.backgroundColor = [UIColor clearColor];
-        win.userInteractionEnabled = YES;
+        // 挂载到现有 keyWindow (SpringBoard 无独立渲染 scene 的自建 UIWindow)
+        UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+        if (!kw) kw = [UIApplication sharedApplication].windows.lastObject;
+        if (!kw) { QMKWarn(@"取色模式: 无可用窗口"); return; }
         // 触摸层: 点击屏幕任意处 = 取色并结束 (光标在其上层, 拖动不误触)
-        QMKPickOverlay *ov = [[QMKPickOverlay alloc] initWithFrame:win.bounds];
+        QMKPickOverlay *ov = [[QMKPickOverlay alloc] initWithFrame:kw.bounds];
         ov.backgroundColor = [UIColor clearColor];
         ov.userInteractionEnabled = YES;
-        [win addSubview:ov];
 
         // 半透明提示条
-        UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 60, win.bounds.size.width, 24)];
+        UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 60, kw.bounds.size.width, 24)];
         tip.text = @"拖动光标至目标区域 · 点击屏幕取色并结束";
         tip.font = [UIFont boldSystemFontOfSize:12];
         tip.textColor = [UIColor whiteColor];
@@ -824,11 +817,12 @@ static void QMKStartColorPick(void) {
         tip.textAlignment = NSTextAlignmentCenter;
         tip.layer.cornerRadius = 6;
         tip.clipsToBounds = YES;
-        [win addSubview:tip];
+        tip.userInteractionEnabled = NO;
+        [ov addSubview:tip];
 
         // 可拖动十字光标 (QMKPickCursor: touchesMoved 自由拖动)
         QMKPickCursor *cur = [[QMKPickCursor alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
-        cur.center = CGPointMake(win.bounds.size.width / 2, win.bounds.size.height / 2);
+        cur.center = CGPointMake(kw.bounds.size.width / 2, kw.bounds.size.height / 2);
         cur.backgroundColor = [UIColor colorWithWhite:0 alpha:0.15];
         cur.layer.cornerRadius = 22;
         cur.layer.borderWidth = 2.5;
@@ -837,10 +831,11 @@ static void QMKStartColorPick(void) {
         cur.layer.shadowOpacity = 0.8;
         cur.layer.shadowRadius = 4;
         cur.userInteractionEnabled = YES;
-        [win addSubview:cur];
+        [ov addSubview:cur];
+
         gPickCursor = cur;
-        gPickWin = win;
-        [win makeKeyAndVisible];
+        gPickOverlay = ov;
+        [kw addSubview:ov];
         QMKInfo(@"取色模式: 已开启 (拖动光标, 点击屏幕取色)");
     } @catch (NSException *e) { QMKErr(@"color-start", e); }
 }
