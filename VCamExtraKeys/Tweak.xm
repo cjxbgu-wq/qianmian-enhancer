@@ -837,7 +837,6 @@ static void VPMEndColorPick(BOOL doPick);   // 前向声明 (overlay 点击回�
     CGFloat w = rect.size.width, h = rect.size.height;
     CGFloat cx = w / 2.0, cy = h / 2.0;
     CGFloat ringR = MIN(w, h) * 0.28;           // 圆环半径
-    CGFloat tick = w * 0.22;                    // 十字线延伸长度 (自边缘向内)
     CGColorRef glow = [UIColor colorWithRed:0.35 green:1 blue:0.65 alpha:0.98].CGColor;
     // 外发光 (多层低透明描边模拟)
     for (int i = 3; i >= 1; i--) {
